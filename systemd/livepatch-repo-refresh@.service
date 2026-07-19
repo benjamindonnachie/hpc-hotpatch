@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile central kernel livepatch repository profile %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/livepatch-repo
+EnvironmentFile=/etc/livepatch-repo/%i.env
+ExecStart=/usr/bin/python3 -m livepatch_repo reconcile --config /etc/livepatch-repo/%i.conf --state-dir /var/lib/livepatch-repo/%i/state --work-root /var/lib/livepatch-repo/%i/jobs --repository-root ${REPOSITORY_ROOT}
+User=root
+Group=root
+UMask=0022
+TimeoutStartSec=172800

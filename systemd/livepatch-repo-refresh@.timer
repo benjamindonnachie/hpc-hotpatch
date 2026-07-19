@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile livepatch repository profile %i
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=10min
+Persistent=true
+Unit=livepatch-repo-refresh@%i.service
+
+[Install]
+WantedBy=timers.target

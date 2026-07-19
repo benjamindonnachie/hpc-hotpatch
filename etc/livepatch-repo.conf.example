@@ -1,0 +1,90 @@
+[repository]
+dnf_command = dnf
+kernel_package = kernel-core
+architecture = x86_64
+distro_stream = el9_8
+# Unique profile writing into the shared major/architecture repository.
+profile = el9_8-x86_64
+
+[policy]
+# The one livepatch base is the kernel actually running on the builder. For a
+# controlled test this may instead be an exact uname -r identity.
+base_kernel = running
+uname_command = uname
+# Only vendor-rated CVEs in these severities become livepatch requirements.
+# Other security CVEs remain visible in the plan as below-policy decisions.
+eligible_cve_severities = Critical,Important
+# Authoritative individual CVE rating. Collection fails closed if a requested
+# CVE has no recognised vendor rating; DNF exposes advisory severity only.
+cve_severity_url_template = https://access.redhat.com/hydra/rest/securitydata/cve.json?ids={cves}&per_page=1000
+
+# Security-coverage escalation. When an in-interval security CVE cannot be
+# confidently classified (no recognised vendor rating), no livepatch can be
+# produced and the base may be exposed. The central host NEVER reboots anything
+# itself. By default this is alert-only: a SECURITY-COVERAGE-GAP line is logged,
+# a durable record is written to <state-dir>/escalation.json, and the reconcile
+# exits with status 3 (distinct from an ordinary error, so an OnFailure= hook
+# can route it). Optionally hand off to your own automation to schedule a kernel
+# update, drain and reboot into the fixed kernel. The command is invoked once
+# per distinct gap (deduplicated on base/target/CVEs) and must be idempotent and
+# return promptly (e.g. enqueue a job). Placeholders: {base} {target} {cves}
+# {reason} {report}. Automation is not yet in place, so this is left empty.
+#
+# Reference hand-off to the GitLab reboot orchestrator (see
+# docs/escalation-ticket-contract.md). GitLab settings come from the unit's
+# environment (GITLAB_URL, GITLAB_PROJECT_ID, GITLAB_TRIGGER_TOKEN, GITLAB_REF);
+# with none set it emits the ticket and sends nothing (alert-only):
+# security_escalation_command_template = python3 -m livepatch_repo.escalation_ticket --report {report}
+security_escalation_command_template =
+security_escalation_timeout_seconds = 300
+
+[builders]
+# The builder has one exact base kernel and at most one cumulative target, so
+# jobs are built sequentially; there is no build-concurrency setting.
+kpatch_build_command = kpatch-build
+# Exact offline-base inputs. The EL9 selector supplies the prepared source
+# tree; these paths must resolve to the matching config and debuginfo image.
+kpatch_config_template = /boot/config-{base}
+kpatch_vmlinux_template = /usr/lib/debug/lib/modules/{base}/vmlinux
+modinfo_command = modinfo
+rpmbuild_command = rpmbuild
+selector_timeout_seconds = 7200
+builder_timeout_seconds = 86400
+packaging_timeout_seconds = 1800
+termination_grace_seconds = 30
+
+# The EL9 adapter prepares exact SRPMs, selects requested CVE patches and
+# series prerequisites, validates them sequentially against the base source,
+# and emits one aggregate net diff plus evidence.
+selector_command_template = python3 -m livepatch_repo.el9_selector --base {base} --target {target} --workspace {workspace} --patch {patch} --manifest {selection_manifest} --requested-cves {requested_cves} --advisory-evidence {advisory_evidence} --module-name {module_name}
+
+# EL10 is intentionally configured rather than assumed. Placeholders:
+# {patch}, {base}, {target}, {module_name}, {output_dir}
+klp_build_command_template =
+
+[publication]
+createrepo_command = createrepo_c
+rpm_command = rpm
+require_rpm_signing = true
+
+# Repository retention. Each publication keeps the newest cumulative RPM per
+# active base-kernel family and drops superseded releases. retain_versions
+# and minimum_retention_age_seconds bound the immutable metadata snapshots.
+retain_versions = 4
+# Must exceed client metadata_expire plus download/retry and clock-skew allowance.
+minimum_retention_age_seconds = 86400
+# A previous builder-kernel family keeps its last release for this long after
+# its final active reconcile, so a still-booted node can reboot away
+# before the livepatch package disappears; then it expires.
+family_grace_seconds = 1209600
+
+# Optional. The command is run after each successful RPM build and before
+# publication. Example:
+# rpm_sign_command_template = rpmsign --addsign {rpm}
+rpm_sign_command_template =
+
+# This must cryptographically verify the signed package. The builder RPM
+# database should import the matching public key so NOKEY is not accepted.
+# Reconciliation separately proves that an OpenPGP signature header exists;
+# `rpmkeys --checksig` alone also exits successfully for digest-only RPMs.
+rpm_verify_command_template = rpmkeys --checksig {rpm}

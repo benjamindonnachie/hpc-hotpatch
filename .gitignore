@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+*.ko
+*.py[cod]
+*.rpm
+__pycache__/
+
+.coverage
+htmlcov/
+state/
+jobs/
+repository/
+rpmbuild/

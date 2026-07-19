@@ -1,0 +1,62 @@
+{
+  "kernels": [
+    {
+      "name": "kernel-core",
+      "epoch": "0",
+      "version": "5.14.0",
+      "release": "687.22.1.el9_8",
+      "arch": "x86_64"
+    },
+    {
+      "name": "kernel-core",
+      "epoch": "0",
+      "version": "5.14.0",
+      "release": "687.23.1.el9_8",
+      "arch": "x86_64"
+    },
+    {
+      "name": "kernel-core",
+      "epoch": "0",
+      "version": "5.14.0",
+      "release": "687.25.1.el9_8",
+      "arch": "x86_64"
+    }
+  ],
+  "advisories": [
+    {
+      "cve": "CVE-2026-54321",
+      "severity": "Important",
+      "kernel": {
+        "name": "kernel-core",
+        "epoch": "0",
+        "version": "5.14.0",
+        "release": "687.24.1.el9_8",
+        "arch": "x86_64"
+      }
+    }
+  ],
+  "notices": [
+    {
+      "advisory_id": "ALSA-2026:9999",
+      "kind": "security",
+      "kernel": {
+        "name": "kernel-core",
+        "epoch": "0",
+        "version": "5.14.0",
+        "release": "687.24.1.el9_8",
+        "arch": "x86_64"
+      }
+    },
+    {
+      "advisory_id": "ALBA-2026:10000",
+      "kind": "bugfix",
+      "kernel": {
+        "name": "kernel-core",
+        "epoch": "0",
+        "version": "5.14.0",
+        "release": "687.25.1.el9_8",
+        "arch": "x86_64"
+      }
+    }
+  ]
+}

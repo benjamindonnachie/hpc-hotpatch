@@ -1,0 +1,8 @@
+[central-livepatch]
+name=Central kernel livepatch repository
+baseurl=https://livepatch.example.invalid/alma/9/x86_64/current/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://livepatch.example.invalid/keys/RPM-GPG-KEY-livepatch
+metadata_expire=15m
