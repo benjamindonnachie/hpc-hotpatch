@@ -288,6 +288,49 @@ def parse_advisory_ticket_evidence(
     return {key: tuple(sorted(value)) for key, value in evidence.items()}
 
 
+def parse_advisory_security_cves(
+    output: str,
+) -> dict[str, tuple[str, ...]]:
+    sections: dict[str, list[str]] = {}
+    current_id: str | None = None
+    in_description = False
+    for raw_line in output.splitlines():
+        update_match = re.match(r"\s*Update ID:\s*(\S+)", raw_line)
+        if update_match:
+            candidate = update_match.group(1).upper()
+            current_id = candidate if ADVISORY_ID_RE.fullmatch(candidate) else None
+            in_description = False
+            if current_id is not None:
+                sections.setdefault(current_id, [])
+            continue
+        if current_id is None:
+            continue
+        description_match = re.match(r"\s*Description:\s?(.*)", raw_line)
+        if description_match:
+            in_description = True
+            sections[current_id].append(description_match.group(1))
+            continue
+        if in_description:
+            continuation = re.match(r"\s*:\s?(.*)", raw_line)
+            if continuation:
+                sections[current_id].append(continuation.group(1))
+                continue
+            if raw_line.strip():
+                in_description = False
+
+    result: dict[str, tuple[str, ...]] = {}
+    for advisory_id, lines in sections.items():
+        cves = {
+            item.upper()
+            for bullet in _description_bullets(lines, "Security Fix(es):")
+            for item in re.findall(
+                r"CVE-[0-9]{4}-[0-9]+", bullet, flags=re.I
+            )
+        }
+        result[advisory_id] = tuple(sorted(cves))
+    return result
+
+
 def parse_notices(output: str) -> tuple[RepositoryNotice, ...]:
     notices: set[RepositoryNotice] = set()
     unmatched: list[str] = []
@@ -477,6 +520,51 @@ class DnfRepositorySource:
             and self.base_kernel < advisory.kernel
             and advisory.kernel <= interval_target
         )
+        notice_output = self._run(
+            ["-q", "updateinfo", "list", "--all", self.package_name]
+        )
+        notices = parse_notices(notice_output)
+        notices = tuple(
+            notice
+            for notice in notices
+            if interval_target is not None
+            and notice.kernel.same_family(self.base_kernel)
+            and self.base_kernel < notice.kernel
+            and notice.kernel <= interval_target
+        )
+        advisories = associate_local_advisory_ids(advisories, notices)
+        security_notices = {
+            notice.advisory_id: notice
+            for notice in notices
+            if notice.kind == "security"
+        }
+        detail_output = ""
+        if security_notices:
+            detail_output = self._run(
+                ["-q", "updateinfo", "info", *sorted(security_notices)]
+            )
+            description_cves = parse_advisory_security_cves(detail_output)
+            existing = {
+                (advisory.kernel, advisory.cve) for advisory in advisories
+            }
+            recovered = [
+                AdvisoryFix(
+                    cve,
+                    notice.kernel,
+                    "Low",
+                    advisory_id,
+                    severity_source="advisory-description-pending",
+                )
+                for advisory_id, notice in security_notices.items()
+                for cve in description_cves.get(advisory_id, ())
+                if (notice.kernel, cve) not in existing
+            ]
+            advisories = tuple(
+                sorted(
+                    (*advisories, *recovered),
+                    key=lambda item: (item.kernel, item.cve),
+                )
+            )
         try:
             cve_severities = self._cve_severities(
                 tuple(sorted({advisory.cve for advisory in advisories}))
@@ -499,28 +587,7 @@ class DnfRepositorySource:
             )
             for advisory in advisories
         )
-        notice_output = self._run(
-            ["-q", "updateinfo", "list", "--all", self.package_name]
-        )
-        notices = parse_notices(notice_output)
-        notices = tuple(
-            notice
-            for notice in notices
-            if interval_target is not None
-            and notice.kernel.same_family(self.base_kernel)
-            and self.base_kernel < notice.kernel
-            and notice.kernel <= interval_target
-        )
-        advisories = associate_local_advisory_ids(advisories, notices)
-        advisory_ids = sorted(
-            {
-                advisory.advisory_id
-                for advisory in advisories
-                if advisory.advisory_id is not None
-            }
-        )
-        if advisory_ids:
-            detail_output = self._run(["-q", "updateinfo", "info", *advisory_ids])
+        if detail_output:
             ticket_evidence = parse_advisory_ticket_evidence(detail_output)
             advisories = tuple(
                 replace(

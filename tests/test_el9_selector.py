@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +10,8 @@ from unittest import mock
 
 from livepatch_repo.el9_selector import (
     _copy_aggregate_paths,
+    changelog_entries,
+    load_folded_source_evidence,
     main,
     prepare_kernel_release,
     prepare_source,
@@ -99,6 +102,141 @@ class TestEl9Selector(unittest.TestCase):
             )
             self.assertFalse(release_file.exists())
             self.assertFalse(uts_file.exists())
+
+    def test_folded_source_evidence_builds_pinned_ticket_scoped_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            unrelated = git_patch("unrelated maintenance", "old", "maintenance")
+            self._kernel_cache(
+                cache,
+                BASE,
+                patches={"0001-unrelated.patch": unrelated},
+                changelog=(
+                    "* Tue Jul 14 2026 Builder [5.14.0-687.24.1.el9_8]\n"
+                ),
+            )
+            self._kernel_cache(
+                cache,
+                TARGET,
+                patches={"0001-unrelated.patch": unrelated},
+                changelog=(
+                    "* Wed Jul 15 2026 Builder [5.14.0-687.25.1.el9_8]\n"
+                    "- drm: security fix (Dev) [RHEL-179886] "
+                    "{CVE-2026-46215}\n"
+                    "* Tue Jul 14 2026 Builder [5.14.0-687.24.1.el9_8]\n"
+                ),
+            )
+            base_tree = (
+                cache
+                / BASE.rsplit(".", 1)[0]
+                / "rpmbuild/BUILD/kernel-build/linux-test"
+            )
+            target_tree = (
+                cache
+                / TARGET.rsplit(".", 1)[0]
+                / "rpmbuild/BUILD/kernel-build/linux-test"
+            )
+            relative = Path("drivers/gpu/drm/drm_gem.c")
+            (base_tree / relative).parent.mkdir(parents=True)
+            (target_tree / relative).parent.mkdir(parents=True)
+            (base_tree / relative).write_text("old implementation\n", encoding="utf-8")
+            (target_tree / relative).write_text(
+                "fixed implementation\n", encoding="utf-8"
+            )
+
+            def digest(path: Path) -> str:
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
+            workspace = root / "workspace"
+            workspace.mkdir()
+            requested = workspace / "requested.txt"
+            requested.write_text("CVE-2026-46215\n", encoding="utf-8")
+            evidence = workspace / "folded-source.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "base": BASE,
+                        "target": TARGET,
+                        "groups": [
+                            {
+                                "ticket": "RHEL-179886",
+                                "cves": ["CVE-2026-46215"],
+                                "files": [
+                                    {
+                                        "path": relative.as_posix(),
+                                        "base_sha256": digest(base_tree / relative),
+                                        "target_sha256": digest(target_tree / relative),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = workspace / "selection.json"
+            patch = workspace / "source.patch"
+            result = main(
+                [
+                    "--base",
+                    BASE,
+                    "--target",
+                    TARGET,
+                    "--workspace",
+                    str(workspace),
+                    "--patch",
+                    str(patch),
+                    "--manifest",
+                    str(manifest),
+                    "--requested-cves",
+                    str(requested),
+                    "--folded-source-evidence",
+                    str(evidence),
+                    "--module-name",
+                    "klp_test_folded",
+                    "--source-cache",
+                    str(cache),
+                    "--spec-evaluation",
+                    "static",
+                ]
+            )
+            self.assertEqual(result, 0)
+            self.assertIn(
+                "drivers/gpu/drm/drm_gem.c",
+                patch.read_text(encoding="utf-8"),
+            )
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(
+                value["applied_patches"],
+                ["folded-source:RHEL-179886"],
+            )
+            self.assertEqual(
+                value["selected_patches"][0]["origins"],
+                [
+                    "operator-folded-source-evidence",
+                    "series(RHEL-179886)",
+                ],
+            )
+            raw_evidence = json.loads(evidence.read_text(encoding="utf-8"))
+            raw_evidence["groups"][0]["files"][0]["target_sha256"] = "0" * 64
+            evidence.write_text(json.dumps(raw_evidence), encoding="utf-8")
+            target_spec = (
+                cache
+                / TARGET.rsplit(".", 1)[0]
+                / "rpmbuild/SPECS/kernel.spec"
+            )
+            with self.assertRaisesRegex(ValueError, "target SHA-256 mismatch"):
+                load_folded_source_evidence(
+                    evidence,
+                    base=BASE,
+                    target=TARGET,
+                    base_tree=base_tree,
+                    target_tree=target_tree,
+                    entries=changelog_entries(target_spec, BASE),
+                    requested_cves=frozenset({"CVE-2026-46215"}),
+                )
 
     def test_rejects_source_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

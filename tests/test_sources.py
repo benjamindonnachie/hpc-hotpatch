@@ -5,6 +5,7 @@ from livepatch_repo.models import AdvisoryFix, KernelRelease, RepositoryNotice
 from livepatch_repo.sources import (
     DnfRepositorySource,
     associate_local_advisory_ids,
+    parse_advisory_security_cves,
     parse_advisory_ticket_evidence,
     parse_cve_severities,
     parse_notices,
@@ -99,6 +100,90 @@ Description: Security update.
         self.assertEqual(
             evidence[("RHSA-2026:36645", "CVE-2026-53266")],
             ("182344",),
+        )
+
+    def test_security_cves_are_recovered_from_advisory_description(self) -> None:
+        details = """\
+  Update ID: ALSA-2026:43307
+Description: Security update.
+           :
+           : Security Fix(es):
+           :
+           :   * kernel: structured reference (CVE-2026-46215)
+           :   * kernel: missing structured reference (CVE-2026-46099)
+           :
+           : Bug Fix(es) and Enhancement(s):
+           :
+           :   * unrelated fix (JIRA:RHEL-183980)
+   Severity: Important
+"""
+        self.assertEqual(
+            parse_advisory_security_cves(details),
+            {
+                "ALSA-2026:43307": (
+                    "CVE-2026-46099",
+                    "CVE-2026-46215",
+                )
+            },
+        )
+
+    def test_collection_recovers_cve_omitted_from_structured_references(self) -> None:
+        base = KernelRelease(
+            "kernel-core", "0", "5.14.0", "687.23.1.el9_8", "x86_64"
+        )
+        target = KernelRelease(
+            "kernel-core", "0", "5.14.0", "687.24.1.el9_8", "x86_64"
+        )
+
+        class FakeSource(DnfRepositorySource):
+            requested_cves: tuple[str, ...] = ()
+
+            def _run(self, arguments: list[str]) -> str:
+                if "repoquery" in arguments:
+                    return REPOQUERY
+                if "--with-cve" in arguments:
+                    return (
+                        "i ALSA-2026:43307 Important/Sec. "
+                        "kernel-core-5.14.0-687.24.1.el9_8.x86_64\n"
+                        "i CVE-2026-46215 Important/Sec. "
+                        "kernel-core-5.14.0-687.24.1.el9_8.x86_64\n"
+                    )
+                if "info" in arguments:
+                    return """\
+  Update ID: ALSA-2026:43307
+Description: Security update.
+           :
+           : Security Fix(es):
+           :
+           :   * kernel: omitted reference (CVE-2026-46099)
+           :   * kernel: retained reference (CVE-2026-46215)
+   Severity: Important
+"""
+                return (
+                    "i ALSA-2026:43307 Important/Sec. "
+                    "kernel-core-5.14.0-687.24.1.el9_8.x86_64\n"
+                )
+
+            def _cve_severities(self, cves: tuple[str, ...]) -> dict[str, str]:
+                self.requested_cves = cves
+                return {cve: "Important" for cve in cves}
+
+        source = FakeSource(
+            "dnf",
+            "kernel-core",
+            "x86_64",
+            "https://x/{cves}",
+            base,
+            target,
+        )
+        snapshot = source.collect()
+        self.assertEqual(
+            source.requested_cves,
+            ("CVE-2026-46099", "CVE-2026-46215"),
+        )
+        self.assertEqual(
+            [item.cve for item in snapshot.advisories],
+            ["CVE-2026-46099", "CVE-2026-46215"],
         )
 
     def test_local_alsa_notice_replaces_unresolvable_rhsa_alias(self) -> None:

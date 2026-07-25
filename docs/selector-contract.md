@@ -63,6 +63,27 @@ tree. The manifest records the reversal in `reversed_superseded_patches`;
 ambiguous prose, an absent patch number, a failed reverse, or a failed forward
 application stops the central job without publishing.
 
+Some current EL9 source RPMs fold vendor changes directly into the released
+source tarball and leave no discrete patch for the selector to map. This is
+not permission to select an arbitrary base-to-target source diff. An operator
+may explicitly pass `--folded-source-evidence FILE` for an exceptional build.
+The versioned JSON must:
+
+- match the exact base and target kernel identities;
+- group every requested CVE under a ticket that the target changelog associates
+  with that CVE;
+- list every ticket-scoped source file; and
+- pin the SHA-256 of each listed file in both prepared source trees.
+
+The selector accepts this fallback only when ordinary selection failed because
+one or more requested CVEs had no selectable patch. It verifies exact CVE
+coverage, changelog ticket provenance, safe regular-file paths and every hash,
+then emits the net diff of only those declared files. Missing, stale,
+over-broad or ambiguous evidence fails closed. Creating the evidence is a
+reviewed operator action: the selector cannot reliably infer which changes in
+a folded cumulative tree are prerequisites belonging to the same vendor
+backport series.
+
 For the EL9 `kpatch-build` backend, `base_source_tree` is also mandatory and
 must name an existing absolute directory. The runner passes that prepared
 tree, the exact base config and the exact base debuginfo `vmlinux` explicitly

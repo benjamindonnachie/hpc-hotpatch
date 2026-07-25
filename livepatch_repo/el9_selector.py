@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import filecmp
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,13 @@ class SelectedPatch:
     path: Path
     origins: tuple[str, ...]
     cves: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FoldedSourceGroup:
+    ticket: str
+    cves: tuple[str, ...]
+    paths: tuple[str, ...]
 
 
 def _run(
@@ -672,6 +680,72 @@ def _copy_aggregate_paths(
             shutil.copy2(source_path, destination_path)
 
 
+def _aggregate_tree_diff(
+    base_tree: Path,
+    final_tree: Path,
+    paths: Iterable[str],
+    *,
+    workspace: Path,
+    output: Path,
+) -> None:
+    allowed = set(paths)
+    if not allowed:
+        raise ValueError("aggregate source path list is empty")
+    aggregate_base = workspace / f"aggregate-base-{os.getpid()}"
+    aggregate_final = workspace / f"aggregate-final-{os.getpid()}"
+    try:
+        _copy_aggregate_paths(base_tree, aggregate_base, allowed)
+        _copy_aggregate_paths(final_tree, aggregate_final, allowed)
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-index",
+                "--binary",
+                "--no-renames",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                str(aggregate_base),
+                str(aggregate_final),
+            ],
+            capture_output=True,
+            check=False,
+            timeout=300,
+        )
+        if completed.returncode not in {0, 1}:
+            raise ValueError("git could not generate the aggregate diff")
+        aggregate = completed.stdout.decode(errors="surrogateescape")
+        source_prefix = f"a/{str(aggregate_base).lstrip('/')}/"
+        final_prefix = f"b/{str(aggregate_final).lstrip('/')}/"
+        aggregate = aggregate.replace(source_prefix, "a/").replace(
+            final_prefix, "b/"
+        )
+        if not aggregate:
+            raise ValueError("validated security series has no net source change")
+        for match in re.finditer(
+            r"^diff --git a/(?P<old>\S+) b/(?P<new>\S+)$",
+            aggregate,
+            flags=re.MULTILINE,
+        ):
+            if match.group("old") != match.group("new"):
+                raise ValueError("aggregate contains a rename or ambiguous path")
+            if match.group("old") not in allowed:
+                raise ValueError(
+                    f"aggregate contains undeclared path: {match.group('old')}"
+                )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            aggregate,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    finally:
+        shutil.rmtree(aggregate_base, ignore_errors=True)
+        shutil.rmtree(aggregate_final, ignore_errors=True)
+
+
 def validate_and_aggregate(
     running_tree: Path,
     running_order: Sequence[Path],
@@ -682,8 +756,6 @@ def validate_and_aggregate(
     output: Path,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     validation = workspace / f"validation-{os.getpid()}"
-    aggregate_base = workspace / f"aggregate-base-{os.getpid()}"
-    aggregate_final = workspace / f"aggregate-final-{os.getpid()}"
     _copy_validation_tree(running_tree, validation)
     running_ids: dict[str, Path] = {}
     for patch in running_order:
@@ -769,52 +841,12 @@ def validate_and_aggregate(
         }
         if not allowed:
             raise ValueError("applicable patches expose no affected paths")
-        _copy_aggregate_paths(running_tree, aggregate_base, allowed)
-        _copy_aggregate_paths(validation, aggregate_final, allowed)
-        completed = subprocess.run(
-            [
-                "git",
-                "-c",
-                "core.quotePath=false",
-                "diff",
-                "--no-index",
-                "--binary",
-                "--no-renames",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                str(aggregate_base),
-                str(aggregate_final),
-            ],
-            capture_output=True,
-            check=False,
-            timeout=300,
-        )
-        if completed.returncode not in {0, 1}:
-            raise ValueError("git could not generate the aggregate diff")
-        aggregate = completed.stdout.decode(errors="surrogateescape")
-        source_prefix = f"a/{str(aggregate_base).lstrip('/')}/"
-        validation_prefix = f"b/{str(aggregate_final).lstrip('/')}/"
-        aggregate = aggregate.replace(source_prefix, "a/").replace(
-            validation_prefix, "b/"
-        )
-        if not aggregate:
-            raise ValueError("validated security series has no net source change")
-        for match in re.finditer(
-            r"^diff --git a/(?P<old>\S+) b/(?P<new>\S+)$",
-            aggregate,
-            flags=re.MULTILINE,
-        ):
-            if match.group("old") != match.group("new"):
-                raise ValueError("aggregate contains a rename or ambiguous path")
-            if match.group("old") not in allowed:
-                raise ValueError(
-                    f"aggregate contains unselected path: {match.group('old')}"
-                )
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            aggregate,
-            encoding="utf-8",
-            errors="surrogateescape",
+        _aggregate_tree_diff(
+            running_tree,
+            validation,
+            allowed,
+            workspace=workspace,
+            output=output,
         )
         return (
             tuple(item.path.name for item in applied),
@@ -823,8 +855,144 @@ def validate_and_aggregate(
         )
     finally:
         shutil.rmtree(validation, ignore_errors=True)
-        shutil.rmtree(aggregate_base, ignore_errors=True)
-        shutil.rmtree(aggregate_final, ignore_errors=True)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _safe_relative_file(tree: Path, value: object) -> tuple[str, Path]:
+    relative = Path(str(value))
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError(f"folded-source evidence contains unsafe path: {value!r}")
+    path = tree / relative
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(
+            f"folded-source evidence path is not a regular source file: {relative}"
+        )
+    return relative.as_posix(), path
+
+
+def load_folded_source_evidence(
+    path: Path,
+    *,
+    base: str,
+    target: str,
+    base_tree: Path,
+    target_tree: Path,
+    entries: Sequence[ChangelogEntry],
+    requested_cves: frozenset[str],
+) -> tuple[FoldedSourceGroup, ...]:
+    with path.open(encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ValueError("folded-source evidence requires schema_version 1")
+    if value.get("base") != base or value.get("target") != target:
+        raise ValueError("folded-source evidence base/target does not match the job")
+    raw_groups = value.get("groups")
+    if not isinstance(raw_groups, list) or not raw_groups:
+        raise ValueError("folded-source evidence groups must be a non-empty list")
+    groups: list[FoldedSourceGroup] = []
+    covered: set[str] = set()
+    declared_paths: set[str] = set()
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict):
+            raise ValueError("folded-source evidence group must be an object")
+        ticket = str(raw_group.get("ticket", ""))
+        if not re.fullmatch(r"(?:RHEL-|BZ-)?[0-9]+", ticket):
+            raise ValueError(f"invalid folded-source ticket: {ticket!r}")
+        raw_cves = raw_group.get("cves")
+        if not isinstance(raw_cves, list) or not raw_cves:
+            raise ValueError(f"folded-source group {ticket} has no CVEs")
+        cves = tuple(sorted({str(item).upper() for item in raw_cves}))
+        invalid = [cve for cve in cves if not CVE_RE.fullmatch(cve)]
+        if invalid:
+            raise ValueError(f"invalid folded-source CVE: {invalid[0]}")
+        unexpected = sorted(set(cves) - requested_cves)
+        if unexpected:
+            raise ValueError(
+                "folded-source evidence CVE is outside the request: "
+                + unexpected[0]
+            )
+        duplicate_cves = sorted(set(cves) & covered)
+        if duplicate_cves:
+            raise ValueError(
+                "folded-source evidence CVE is declared more than once: "
+                + duplicate_cves[0]
+            )
+        for cve in cves:
+            if not any(
+                cve in entry.cves and ticket in entry.tickets
+                for entry in entries
+            ):
+                raise ValueError(
+                    f"folded-source evidence lacks changelog proof for "
+                    f"{cve}/{ticket}"
+                )
+        raw_files = raw_group.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise ValueError(f"folded-source group {ticket} has no files")
+        paths: list[str] = []
+        for raw_file in raw_files:
+            if not isinstance(raw_file, dict):
+                raise ValueError(
+                    f"folded-source group {ticket} file must be an object"
+                )
+            relative, base_path = _safe_relative_file(
+                base_tree, raw_file.get("path")
+            )
+            target_relative, target_path = _safe_relative_file(
+                target_tree, raw_file.get("path")
+            )
+            if target_relative != relative:
+                raise ValueError("folded-source file path normalisation mismatch")
+            if relative in declared_paths:
+                raise ValueError(
+                    f"folded-source file is declared more than once: {relative}"
+                )
+            expected_base = str(raw_file.get("base_sha256", "")).lower()
+            expected_target = str(raw_file.get("target_sha256", "")).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_base):
+                raise ValueError(
+                    f"invalid folded-source base SHA-256 for {relative}"
+                )
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_target):
+                raise ValueError(
+                    f"invalid folded-source target SHA-256 for {relative}"
+                )
+            actual_base = _sha256(base_path)
+            actual_target = _sha256(target_path)
+            if actual_base != expected_base:
+                raise ValueError(
+                    f"folded-source base SHA-256 mismatch for {relative}"
+                )
+            if actual_target != expected_target:
+                raise ValueError(
+                    f"folded-source target SHA-256 mismatch for {relative}"
+                )
+            if actual_base == actual_target:
+                raise ValueError(
+                    f"folded-source file is unchanged between releases: {relative}"
+                )
+            paths.append(relative)
+            declared_paths.add(relative)
+        groups.append(FoldedSourceGroup(ticket, cves, tuple(paths)))
+        covered.update(cves)
+    missing = sorted(requested_cves - covered)
+    if missing:
+        raise ValueError(
+            "folded-source evidence does not cover requested CVE(s): "
+            + ", ".join(missing)
+        )
+    return tuple(groups)
 
 
 def _requested_cves(path: Path) -> frozenset[str]:
@@ -917,35 +1085,82 @@ def select(args: argparse.Namespace) -> None:
         rpmspec_command=args.rpmspec_command,
     )
     entries = changelog_entries(target.spec, args.base)
-    selected = select_patches(
-        running_order,
-        target_order,
-        entries,
-        requested,
-        advisory_ticket_ids,
+    folded_groups: tuple[FoldedSourceGroup, ...] = ()
+    try:
+        selected = select_patches(
+            running_order,
+            target_order,
+            entries,
+            requested,
+            advisory_ticket_ids,
+        )
+    except ValueError as error:
+        if (
+            args.folded_source_evidence is None
+            or not str(error).startswith(
+                "requested CVE(s) have no selected patch:"
+            )
+        ):
+            raise
+        folded_groups = load_folded_source_evidence(
+            args.folded_source_evidence,
+            base=args.base,
+            target=args.target,
+            base_tree=base.tree,
+            target_tree=target.tree,
+            entries=entries,
+            requested_cves=requested,
+        )
+        _aggregate_tree_diff(
+            base.tree,
+            target.tree,
+            (
+                relative
+                for group in folded_groups
+                for relative in group.paths
+            ),
+            workspace=workspace,
+            output=args.patch,
+        )
+        selected = ()
+        applied = tuple(f"folded-source:{group.ticket}" for group in folded_groups)
+        already_present = ()
+        reversed_patches = ()
+    else:
+        superseded = select_superseded_patches(
+            running_order,
+            target_order,
+            entries,
+            requested,
+        )
+        applied, already_present, reversed_patches = validate_and_aggregate(
+            base.tree,
+            running_order,
+            selected,
+            superseded,
+            workspace=workspace,
+            output=args.patch,
+        )
+    report = (
+        [
+            {
+                "patch": item.path.name,
+                "origins": list(item.origins),
+                "cves": list(item.cves),
+            }
+            for item in selected
+        ]
+        if selected
+        else [
+            {
+                "patch": f"folded-source:{group.ticket}",
+                "origins": ["operator-folded-source-evidence", f"series({group.ticket})"],
+                "cves": list(group.cves),
+                "paths": list(group.paths),
+            }
+            for group in folded_groups
+        ]
     )
-    superseded = select_superseded_patches(
-        running_order,
-        target_order,
-        entries,
-        requested,
-    )
-    applied, already_present, reversed_patches = validate_and_aggregate(
-        base.tree,
-        running_order,
-        selected,
-        superseded,
-        workspace=workspace,
-        output=args.patch,
-    )
-    report = [
-        {
-            "patch": item.path.name,
-            "origins": list(item.origins),
-            "cves": list(item.cves),
-        }
-        for item in selected
-    ]
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     args.manifest.write_text(
         json.dumps(
@@ -965,6 +1180,11 @@ def select(args: argparse.Namespace) -> None:
                 "applied_patches": list(applied),
                 "already_present_patches": list(already_present),
                 "reversed_superseded_patches": list(reversed_patches),
+                "folded_source_evidence": (
+                    str(args.folded_source_evidence.resolve())
+                    if folded_groups
+                    else None
+                ),
             },
             indent=2,
             sort_keys=True,
@@ -985,6 +1205,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--requested-cves", type=Path, required=True)
     parser.add_argument("--advisory-evidence", type=Path)
+    parser.add_argument("--folded-source-evidence", type=Path)
     parser.add_argument("--module-name", required=True)
     parser.add_argument(
         "--source-cache",
