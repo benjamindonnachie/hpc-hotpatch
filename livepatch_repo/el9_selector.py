@@ -62,6 +62,8 @@ class FoldedSourceGroup:
     ticket: str
     cves: tuple[str, ...]
     paths: tuple[str, ...]
+    patch: str = ""
+    selected_hunks: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _run(
@@ -865,6 +867,80 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def _file_diff(base_path: Path, target_path: Path, relative: str) -> str:
+    completed = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-index",
+            "--binary",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            str(base_path),
+            str(target_path),
+        ],
+        capture_output=True,
+        check=False,
+        timeout=300,
+    )
+    if completed.returncode not in {0, 1}:
+        raise ValueError(f"git could not diff folded-source file: {relative}")
+    diff = completed.stdout.decode(errors="surrogateescape")
+    diff = diff.replace(
+        f"a/{str(base_path).lstrip('/')}", f"a/{relative}"
+    ).replace(
+        f"b/{str(target_path).lstrip('/')}", f"b/{relative}"
+    )
+    if not diff:
+        raise ValueError(f"folded-source file is unchanged between releases: {relative}")
+    return diff
+
+
+def _select_diff_hunks(
+    diff: str, requested_hashes: Sequence[str], relative: str
+) -> tuple[str, tuple[str, ...]]:
+    starts = [match.start() for match in re.finditer(r"^@@ ", diff, re.MULTILINE)]
+    if not starts:
+        raise ValueError(f"folded-source hunk selection requires a text diff: {relative}")
+    header = diff[: starts[0]]
+    hunks = tuple(
+        diff[start : starts[index + 1] if index + 1 < len(starts) else len(diff)]
+        for index, start in enumerate(starts)
+    )
+    available = {_text_sha256(hunk): hunk for hunk in hunks}
+    selected: list[str] = []
+    normalised: list[str] = []
+    for value in requested_hashes:
+        digest = str(value).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"invalid folded-source hunk SHA-256 for {relative}")
+        if digest in normalised:
+            raise ValueError(f"duplicate folded-source hunk SHA-256 for {relative}")
+        try:
+            selected.append(available[digest])
+        except KeyError as error:
+            raise ValueError(
+                f"folded-source hunk SHA-256 mismatch for {relative}: {digest}"
+            ) from error
+        normalised.append(digest)
+    return header + "".join(selected), tuple(normalised)
+
+
+def _write_folded_patch(groups: Sequence[FoldedSourceGroup], output: Path) -> None:
+    patch = "".join(group.patch for group in groups)
+    if not patch:
+        raise ValueError("folded-source hunk evidence produced no patch")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(patch, encoding="utf-8", errors="surrogateescape")
+
+
 def _safe_relative_file(tree: Path, value: object) -> tuple[str, Path]:
     relative = Path(str(value))
     if (
@@ -890,11 +966,13 @@ def load_folded_source_evidence(
     target_tree: Path,
     entries: Sequence[ChangelogEntry],
     requested_cves: frozenset[str],
+    advisory_ticket_ids: dict[str, frozenset[str]],
 ) -> tuple[FoldedSourceGroup, ...]:
     with path.open(encoding="utf-8") as handle:
         value = json.load(handle)
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise ValueError("folded-source evidence requires schema_version 1")
+    if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
+        raise ValueError("folded-source evidence requires schema_version 1 or 2")
+    schema_version = value["schema_version"]
     if value.get("base") != base or value.get("target") != target:
         raise ValueError("folded-source evidence base/target does not match the job")
     raw_groups = value.get("groups")
@@ -929,18 +1007,26 @@ def load_folded_source_evidence(
                 + duplicate_cves[0]
             )
         for cve in cves:
-            if not any(
+            changelog_proof = any(
                 cve in entry.cves and ticket in entry.tickets
                 for entry in entries
-            ):
+            )
+            advisory_proof = (
+                _ticket_id(ticket)
+                in advisory_ticket_ids.get(cve, frozenset())
+                and any(ticket in entry.tickets for entry in entries)
+            )
+            if not (changelog_proof or advisory_proof):
                 raise ValueError(
-                    f"folded-source evidence lacks changelog proof for "
+                    f"folded-source evidence lacks changelog or advisory-ticket proof for "
                     f"{cve}/{ticket}"
                 )
         raw_files = raw_group.get("files")
         if not isinstance(raw_files, list) or not raw_files:
             raise ValueError(f"folded-source group {ticket} has no files")
         paths: list[str] = []
+        patches: list[str] = []
+        selected_hunks: list[tuple[str, tuple[str, ...]]] = []
         for raw_file in raw_files:
             if not isinstance(raw_file, dict):
                 raise ValueError(
@@ -978,13 +1064,31 @@ def load_folded_source_evidence(
                 raise ValueError(
                     f"folded-source target SHA-256 mismatch for {relative}"
                 )
-            if actual_base == actual_target:
-                raise ValueError(
-                    f"folded-source file is unchanged between releases: {relative}"
+            diff = _file_diff(base_path, target_path, relative)
+            if schema_version == 2:
+                raw_hunks = raw_file.get("hunks")
+                if not isinstance(raw_hunks, list) or not raw_hunks:
+                    raise ValueError(
+                        f"folded-source schema 2 file has no hunks: {relative}"
+                    )
+                selected_patch, hashes = _select_diff_hunks(
+                    diff, raw_hunks, relative
                 )
+                patches.append(selected_patch)
+                selected_hunks.append((relative, hashes))
+            elif "hunks" in raw_file:
+                raise ValueError("folded-source hunks require schema_version 2")
             paths.append(relative)
             declared_paths.add(relative)
-        groups.append(FoldedSourceGroup(ticket, cves, tuple(paths)))
+        groups.append(
+            FoldedSourceGroup(
+                ticket,
+                cves,
+                tuple(paths),
+                "".join(patches),
+                tuple(selected_hunks),
+            )
+        )
         covered.update(cves)
     missing = sorted(requested_cves - covered)
     if missing:
@@ -1110,18 +1214,22 @@ def select(args: argparse.Namespace) -> None:
             target_tree=target.tree,
             entries=entries,
             requested_cves=requested,
+            advisory_ticket_ids=advisory_ticket_ids,
         )
-        _aggregate_tree_diff(
-            base.tree,
-            target.tree,
-            (
-                relative
-                for group in folded_groups
-                for relative in group.paths
-            ),
-            workspace=workspace,
-            output=args.patch,
-        )
+        if any(group.patch for group in folded_groups):
+            _write_folded_patch(folded_groups, args.patch)
+        else:
+            _aggregate_tree_diff(
+                base.tree,
+                target.tree,
+                (
+                    relative
+                    for group in folded_groups
+                    for relative in group.paths
+                ),
+                workspace=workspace,
+                output=args.patch,
+            )
         selected = ()
         applied = tuple(f"folded-source:{group.ticket}" for group in folded_groups)
         already_present = ()
@@ -1157,6 +1265,10 @@ def select(args: argparse.Namespace) -> None:
                 "origins": ["operator-folded-source-evidence", f"series({group.ticket})"],
                 "cves": list(group.cves),
                 "paths": list(group.paths),
+                "selected_hunks": {
+                    relative: list(hashes)
+                    for relative, hashes in group.selected_hunks
+                },
             }
             for group in folded_groups
         ]

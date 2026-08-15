@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -9,7 +10,10 @@ import unittest
 from unittest import mock
 
 from livepatch_repo.el9_selector import (
+    ChangelogEntry,
     _copy_aggregate_paths,
+    _file_diff,
+    _text_sha256,
     changelog_entries,
     load_folded_source_evidence,
     main,
@@ -236,6 +240,184 @@ class TestEl9Selector(unittest.TestCase):
                     target_tree=target_tree,
                     entries=changelog_entries(target_spec, BASE),
                     requested_cves=frozenset({"CVE-2026-46215"}),
+                    advisory_ticket_ids={},
+                )
+
+    def test_folded_source_accepts_late_cve_advisory_ticket_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_tree = root / "base"
+            target_tree = root / "target"
+            relative = Path("arch/x86/kvm/mmu/mmu.c")
+            (base_tree / relative).parent.mkdir(parents=True)
+            (target_tree / relative).parent.mkdir(parents=True)
+            (base_tree / relative).write_text("old\n", encoding="utf-8")
+            (target_tree / relative).write_text("fixed\n", encoding="utf-8")
+            evidence = root / "folded-source.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "base": BASE,
+                        "target": TARGET,
+                        "groups": [
+                            {
+                                "ticket": "RHEL-213468",
+                                "cves": ["CVE-2026-64561"],
+                                "files": [
+                                    {
+                                        "path": relative.as_posix(),
+                                        "base_sha256": hashlib.sha256(
+                                            (base_tree / relative).read_bytes()
+                                        ).hexdigest(),
+                                        "target_sha256": hashlib.sha256(
+                                            (target_tree / relative).read_bytes()
+                                        ).hexdigest(),
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entry = ChangelogEntry(
+                text=(
+                    "KVM: x86: Check for invalid/obsolete root after making "
+                    "MMU pages available [RHEL-213468]"
+                ),
+                slug="kvm-x86-check-invalid-root",
+                stripped_slug="kvm-x86-check-invalid-root",
+                subject_key="kvm-x86-check-invalid-root",
+                cves=frozenset(),
+                all_cves=frozenset(),
+                tickets=frozenset({"RHEL-213468"}),
+            )
+
+            groups = load_folded_source_evidence(
+                evidence,
+                base=BASE,
+                target=TARGET,
+                base_tree=base_tree,
+                target_tree=target_tree,
+                entries=(entry,),
+                requested_cves=frozenset({"CVE-2026-64561"}),
+                advisory_ticket_ids={"CVE-2026-64561": frozenset({"213468"})},
+            )
+
+            self.assertEqual(groups[0].ticket, "RHEL-213468")
+
+            with self.assertRaisesRegex(
+                ValueError, "lacks changelog or advisory-ticket proof"
+            ):
+                load_folded_source_evidence(
+                    evidence,
+                    base=BASE,
+                    target=TARGET,
+                    base_tree=base_tree,
+                    target_tree=target_tree,
+                    entries=(entry,),
+                    requested_cves=frozenset({"CVE-2026-64561"}),
+                    advisory_ticket_ids={},
+                )
+
+    def test_folded_source_schema_two_selects_only_pinned_hunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_tree = root / "base"
+            target_tree = root / "target"
+            relative = Path("arch/x86/kvm/mmu/mmu.c")
+            (base_tree / relative).parent.mkdir(parents=True)
+            (target_tree / relative).parent.mkdir(parents=True)
+            base_lines = [f"line {number}\n" for number in range(24)]
+            target_lines = list(base_lines)
+            target_lines[2] = "important security fix\n"
+            target_lines[20] = "unrelated collateral\n"
+            (base_tree / relative).write_text("".join(base_lines), encoding="utf-8")
+            (target_tree / relative).write_text(
+                "".join(target_lines), encoding="utf-8"
+            )
+            full_diff = _file_diff(
+                base_tree / relative, target_tree / relative, relative.as_posix()
+            )
+            starts = [
+                match.start()
+                for match in re.finditer(r"^@@ ", full_diff, re.MULTILINE)
+            ]
+            hunks = [
+                full_diff[start : starts[index + 1] if index + 1 < len(starts) else len(full_diff)]
+                for index, start in enumerate(starts)
+            ]
+            self.assertEqual(len(hunks), 2)
+            evidence = root / "folded-source.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "base": BASE,
+                        "target": TARGET,
+                        "groups": [
+                            {
+                                "ticket": "RHEL-213468",
+                                "cves": ["CVE-2026-64561"],
+                                "files": [
+                                    {
+                                        "path": relative.as_posix(),
+                                        "base_sha256": hashlib.sha256(
+                                            (base_tree / relative).read_bytes()
+                                        ).hexdigest(),
+                                        "target_sha256": hashlib.sha256(
+                                            (target_tree / relative).read_bytes()
+                                        ).hexdigest(),
+                                        "hunks": [_text_sha256(hunks[0])],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entry = ChangelogEntry(
+                text="KVM fix [RHEL-213468]",
+                slug="kvm-fix",
+                stripped_slug="kvm-fix",
+                subject_key="kvm-fix",
+                cves=frozenset(),
+                all_cves=frozenset(),
+                tickets=frozenset({"RHEL-213468"}),
+            )
+            groups = load_folded_source_evidence(
+                evidence,
+                base=BASE,
+                target=TARGET,
+                base_tree=base_tree,
+                target_tree=target_tree,
+                entries=(entry,),
+                requested_cves=frozenset({"CVE-2026-64561"}),
+                advisory_ticket_ids={"CVE-2026-64561": frozenset({"213468"})},
+            )
+            self.assertIn("important security fix", groups[0].patch)
+            self.assertNotIn("unrelated collateral", groups[0].patch)
+            self.assertEqual(
+                groups[0].selected_hunks[0][1], (_text_sha256(hunks[0]),)
+            )
+
+            raw = json.loads(evidence.read_text(encoding="utf-8"))
+            raw["groups"][0]["files"][0]["hunks"] = ["0" * 64]
+            evidence.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "hunk SHA-256 mismatch"):
+                load_folded_source_evidence(
+                    evidence,
+                    base=BASE,
+                    target=TARGET,
+                    base_tree=base_tree,
+                    target_tree=target_tree,
+                    entries=(entry,),
+                    requested_cves=frozenset({"CVE-2026-64561"}),
+                    advisory_ticket_ids={
+                        "CVE-2026-64561": frozenset({"213468"})
+                    },
                 )
 
     def test_rejects_source_version_mismatch(self) -> None:
