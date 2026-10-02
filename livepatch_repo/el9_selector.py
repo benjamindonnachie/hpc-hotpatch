@@ -59,11 +59,16 @@ class SelectedPatch:
 
 @dataclass(frozen=True)
 class FoldedSourceGroup:
-    ticket: str
+    tickets: tuple[str, ...]
     cves: tuple[str, ...]
     paths: tuple[str, ...]
     patch: str = ""
     selected_hunks: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    @property
+    def ticket(self) -> str:
+        """Return the stable manifest label for this ticket series."""
+        return "+".join(self.tickets)
 
 
 def _run(
@@ -871,7 +876,9 @@ def _text_sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
 
 
-def _file_diff(base_path: Path, target_path: Path, relative: str) -> str:
+def _file_diff(
+    base_path: Path, target_path: Path, relative: str, *, context: int = 3
+) -> str:
     completed = subprocess.run(
         [
             "git",
@@ -881,6 +888,7 @@ def _file_diff(base_path: Path, target_path: Path, relative: str) -> str:
             "--no-index",
             "--binary",
             "--no-renames",
+            f"--unified={context}",
             "--src-prefix=a/",
             "--dst-prefix=b/",
             str(base_path),
@@ -933,6 +941,35 @@ def _select_diff_hunks(
     return header + "".join(selected), tuple(normalised)
 
 
+def _drop_added_line(patch: str, line: str, relative: str) -> str:
+    needle = f"+{line}\n"
+    if patch.count(needle) != 1:
+        raise ValueError(
+            "folded-source adaptation line must occur exactly once "
+            f"for {relative}: {line!r}"
+        )
+    position = patch.index(needle)
+    hunk_start = patch.rfind("\n@@ ", 0, position)
+    hunk_start = 0 if hunk_start < 0 else hunk_start + 1
+    header_end = patch.find("\n", hunk_start)
+    header = patch[hunk_start:header_end]
+    match = re.match(
+        r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$", header
+    )
+    if match is None:
+        raise ValueError(f"cannot recount adapted folded-source hunk for {relative}")
+    old_start, old_count, new_start, new_count, suffix = match.groups()
+    adjusted_new_count = int(new_count or "1") - 1
+    if adjusted_new_count < 0:
+        raise ValueError(f"invalid adapted folded-source hunk count for {relative}")
+    adjusted_header = (
+        f"@@ -{old_start},{old_count or '1'} "
+        f"+{new_start},{adjusted_new_count} @@{suffix}"
+    )
+    patch = patch[:hunk_start] + adjusted_header + patch[header_end:]
+    return patch.replace(needle, "", 1)
+
+
 def _write_folded_patch(groups: Sequence[FoldedSourceGroup], output: Path) -> None:
     patch = "".join(group.patch for group in groups)
     if not patch:
@@ -973,6 +1010,9 @@ def load_folded_source_evidence(
     if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
         raise ValueError("folded-source evidence requires schema_version 1 or 2")
     schema_version = value["schema_version"]
+    diff_context = value.get("diff_context", 3)
+    if diff_context not in {0, 1, 3}:
+        raise ValueError("folded-source diff_context must be 0, 1, or 3")
     if value.get("base") != base or value.get("target") != target:
         raise ValueError("folded-source evidence base/target does not match the job")
     raw_groups = value.get("groups")
@@ -984,12 +1024,36 @@ def load_folded_source_evidence(
     for raw_group in raw_groups:
         if not isinstance(raw_group, dict):
             raise ValueError("folded-source evidence group must be an object")
-        ticket = str(raw_group.get("ticket", ""))
-        if not re.fullmatch(r"(?:RHEL-|BZ-)?[0-9]+", ticket):
-            raise ValueError(f"invalid folded-source ticket: {ticket!r}")
+        has_ticket = "ticket" in raw_group
+        has_tickets = "tickets" in raw_group
+        if has_ticket == has_tickets:
+            raise ValueError(
+                "folded-source group requires exactly one of ticket or tickets"
+            )
+        if has_tickets:
+            if schema_version != 2:
+                raise ValueError("folded-source tickets require schema_version 2")
+            raw_tickets = raw_group["tickets"]
+            if not isinstance(raw_tickets, list) or not raw_tickets:
+                raise ValueError("folded-source tickets must be a non-empty list")
+            tickets = tuple(str(item) for item in raw_tickets)
+        else:
+            tickets = (str(raw_group["ticket"]),)
+        invalid_tickets = [
+            ticket
+            for ticket in tickets
+            if not re.fullmatch(r"(?:RHEL-|BZ-)?[0-9]+", ticket)
+        ]
+        if invalid_tickets:
+            raise ValueError(
+                f"invalid folded-source ticket: {invalid_tickets[0]!r}"
+            )
+        if len(set(tickets)) != len(tickets):
+            raise ValueError("folded-source tickets must not contain duplicates")
+        ticket_label = "+".join(tickets)
         raw_cves = raw_group.get("cves")
         if not isinstance(raw_cves, list) or not raw_cves:
-            raise ValueError(f"folded-source group {ticket} has no CVEs")
+            raise ValueError(f"folded-source group {ticket_label} has no CVEs")
         cves = tuple(sorted({str(item).upper() for item in raw_cves}))
         invalid = [cve for cve in cves if not CVE_RE.fullmatch(cve)]
         if invalid:
@@ -1007,30 +1071,34 @@ def load_folded_source_evidence(
                 + duplicate_cves[0]
             )
         for cve in cves:
-            changelog_proof = any(
-                cve in entry.cves and ticket in entry.tickets
-                for entry in entries
-            )
-            advisory_proof = (
-                _ticket_id(ticket)
-                in advisory_ticket_ids.get(cve, frozenset())
-                and any(ticket in entry.tickets for entry in entries)
-            )
-            if not (changelog_proof or advisory_proof):
+            proved_tickets = {
+                ticket
+                for ticket in tickets
+                if any(
+                    cve in entry.cves and ticket in entry.tickets
+                    for entry in entries
+                )
+                or (
+                    _ticket_id(ticket)
+                    in advisory_ticket_ids.get(cve, frozenset())
+                    and any(ticket in entry.tickets for entry in entries)
+                )
+            }
+            if not proved_tickets:
                 raise ValueError(
                     f"folded-source evidence lacks changelog or advisory-ticket proof for "
-                    f"{cve}/{ticket}"
+                    f"{cve}/{ticket_label}"
                 )
         raw_files = raw_group.get("files")
         if not isinstance(raw_files, list) or not raw_files:
-            raise ValueError(f"folded-source group {ticket} has no files")
+            raise ValueError(f"folded-source group {ticket_label} has no files")
         paths: list[str] = []
         patches: list[str] = []
         selected_hunks: list[tuple[str, tuple[str, ...]]] = []
         for raw_file in raw_files:
             if not isinstance(raw_file, dict):
                 raise ValueError(
-                    f"folded-source group {ticket} file must be an object"
+                    f"folded-source group {ticket_label} file must be an object"
                 )
             relative, base_path = _safe_relative_file(
                 base_tree, raw_file.get("path")
@@ -1064,7 +1132,9 @@ def load_folded_source_evidence(
                 raise ValueError(
                     f"folded-source target SHA-256 mismatch for {relative}"
                 )
-            diff = _file_diff(base_path, target_path, relative)
+            diff = _file_diff(
+                base_path, target_path, relative, context=diff_context
+            )
             if schema_version == 2:
                 raw_hunks = raw_file.get("hunks")
                 if not isinstance(raw_hunks, list) or not raw_hunks:
@@ -1074,6 +1144,18 @@ def load_folded_source_evidence(
                 selected_patch, hashes = _select_diff_hunks(
                     diff, raw_hunks, relative
                 )
+                drop_added_lines = raw_file.get("drop_added_lines", [])
+                if not isinstance(drop_added_lines, list) or not all(
+                    isinstance(line, str) and "\n" not in line
+                    for line in drop_added_lines
+                ):
+                    raise ValueError(
+                        f"invalid folded-source drop_added_lines for {relative}"
+                    )
+                for line in drop_added_lines:
+                    selected_patch = _drop_added_line(
+                        selected_patch, line, relative
+                    )
                 patches.append(selected_patch)
                 selected_hunks.append((relative, hashes))
             elif "hunks" in raw_file:
@@ -1082,7 +1164,7 @@ def load_folded_source_evidence(
             declared_paths.add(relative)
         groups.append(
             FoldedSourceGroup(
-                ticket,
+                tickets,
                 cves,
                 tuple(paths),
                 "".join(patches),

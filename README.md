@@ -186,6 +186,24 @@ Install the central host layout with:
 sudo bash sbin/install.sh
 ```
 
+By default this creates an unprivileged `klp-build` system account (no login
+shell, no sudo) to run the timer, and points the large build workspace and
+the published repository at dedicated storage: `/var/lib/klp-policy/build`
+and `/srv/klp/repo`. All of this is customisable per deployment:
+
+```bash
+sudo bash sbin/install.sh \
+  --work-root /var/lib/klp-policy/build/el9_8-x86_64 \
+  --repository-root /srv/klp/repo \
+  --state-dir /var/lib/livepatch-repo/el9_8-x86_64/state \
+  --build-user klp-build --build-group klp-build
+```
+
+Run `sbin/install.sh --help` for the full flag list. Paths are rendered into
+the profile's `.env` file (`REPOSITORY_ROOT`/`WORK_ROOT`/`STATE_DIR`), which
+the systemd unit sources — nothing about their location is hardcoded in the
+unit itself.
+
 Edit `/etc/livepatch-repo/el9_8-x86_64.conf` and the matching `.env`, configure
 and import the production signing key, then enable the profile timer:
 
@@ -205,18 +223,28 @@ The equivalent manual command is:
 python3 -m livepatch_repo reconcile \
   --config /etc/livepatch-repo/el9_8-x86_64.conf \
   --state-dir /var/lib/livepatch-repo/el9_8-x86_64/state \
-  --work-root /var/lib/livepatch-repo/el9_8-x86_64/jobs \
-  --repository-root /srv/livepatch-repo/alma/9/x86_64
+  --work-root /var/lib/klp-policy/build/el9_8-x86_64 \
+  --repository-root /srv/klp/repo
 ```
 
 Every profile run takes an exclusive state lock, refreshes repository and advisory metadata,
 and writes the snapshot and plan before doing any build work. The at-most-one
 pending job is built in its own workspace with a private kpatch cache, writable
 source copy, log, module directory and RPM tree. A failed build records its
-outcome, retains the allocated RPM release for retry, and does not publish. An
-already published job is not rebuilt. If a newer bugfix-only target produces
-the same CVE requirement for a base, the existing cumulative RPM is recorded
-as covering the new plan rather than rebuilt under a new target identity.
+outcome, retains the allocated RPM release, and does not publish. Generic
+failures remain retryable. A recognised deterministic kpatch limitation, such
+as an unsupported ELF section change, marks its uncovered CVEs as terminal for
+that exact base. Any later target which still requires one of those CVEs fails
+fast and alerts before allocating a release or invoking `kpatch-build`; a
+bugfix-only `.26` therefore cannot wastefully rebuild after the required `.25`
+fix has already proved unpatchable. Advancing the builder/fleet base naturally
+starts a new family. The retained terminal gap also takes precedence while a
+later kernel's own updateinfo notice is still pending: incomplete metadata
+cannot erase the already established exposure. An already published job is
+not rebuilt. If a newer
+bugfix-only target produces the same CVE requirement for a base, the existing
+cumulative RPM is recorded as covering the new plan rather than rebuilt under
+a new target identity.
 Registry entries retain the stable digest-addressed RPM object path, so routine
 job workspace and repository-snapshot cleanup does not discard coverage
 evidence.
@@ -225,18 +253,23 @@ published with `createrepo_c`. The builder RPM database must import the
 matching public key so `rpmkeys --checksig` proves the signature rather than
 reporting `NOKEY`. Reconciliation also requires a non-empty OpenPGP signature
 header because `rpmkeys --checksig` exits successfully for unsigned,
-digest-valid RPMs. Set
+digest-valid RPMs. Signing itself can be automatic
+(`rpm_sign_command_template` set) or manual: with `require_rpm_signing = true`
+and no sign command configured (the shipped default), a completed build is
+held as `awaiting-signature` rather than published; an operator signs the RPM
+in place and the next reconcile run promotes and publishes it (see
+[`docs/rpm-contract.md`](docs/rpm-contract.md)). Set
 `require_rpm_signing = false` only for an isolated field test. The repository
 consumer path is the shared profile environment root followed by `/current`
-(for example `/srv/livepatch-repo/alma/9/x86_64/current`), an atomically
-replaced symlink to an immutable version directory.
+(for example `/srv/klp/repo/current`), an atomically replaced symlink to an
+immutable version directory.
 
 ## Repository topology and retention
 
 One planning profile handles one exact EL minor stream and architecture, for
 example `el9_8-x86_64`. Profiles keep separate state and work directories, but
 profiles for the same EL major and architecture publish into one shared
-repository such as `/srv/livepatch-repo/alma/9/x86_64`.
+repository such as `/srv/klp/repo`.
 
 Expensive selection and compilation may overlap both within and across
 profiles. Every kpatch job uses a private `CACHEDIR` and a private writable
@@ -281,7 +314,7 @@ python3 -m livepatch_repo run-job \
   --config /etc/livepatch-repo/el9_8-x86_64.conf \
   --plan /var/lib/livepatch-repo/el9_8-x86_64/state/plan.json \
   --job-id el9_8-x86_64-0123456789abcdef \
-  --work-root /var/lib/livepatch-repo/el9_8-x86_64/jobs \
+  --work-root /var/lib/klp-policy/build/el9_8-x86_64 \
   --rpm-release 1
 ```
 
@@ -363,6 +396,17 @@ envelope. Every security advisory in `(base, target]` must also have at least
 one parsed CVE row. Until those conditions hold, the affected job is
 `metadata-pending`: it is neither built nor classified as `no-work`.
 
+`metadata-pending` is an alerted condition, not an indefinitely successful
+idle state. Its first observation writes `<state-dir>/metadata-pending.json`,
+raises `repository-metadata-pending` through the normal security escalation
+path and exits with status 3. The record retains `first_seen` across timer
+runs. If metadata is still incomplete after
+`metadata_pending_timeout_seconds` (24 hours by default), reconciliation raises
+the distinct `repository-metadata-timeout` condition, causing a configured
+deduplicated notification hook to be invoked again. Complete metadata clears
+the pending-state record and reconciliation proceeds to `no-work` or a build;
+the historical escalation report remains available for audit.
+
 Missing, malformed or contradictory in-scope metadata is an error, never
 `no-work`, and leaves the previously published repository untouched.
 Advisory fixing versions do not need to remain downloadable: retained
@@ -370,13 +414,14 @@ updateinfo for an intermediate release still participates in the interval.
 
 ### Security-coverage escalation
 
-An in-interval security CVE whose vendor severity cannot be resolved (absent or
-unrecognised rating) is a distinct, escalated failure: the interval cannot be
-classified, so no livepatch is produced and nodes on the base may be exposed.
+An available target whose updateinfo is incomplete, an in-interval security
+CVE whose vendor severity cannot be resolved, or a selected security build
+which kpatch cannot safely represent is a distinct escalated failure: no
+complete livepatch is produced and nodes on the base may be exposed.
 The central host **never reboots anything itself**. By default the reconcile:
 
-* logs a prominent `SECURITY-COVERAGE-GAP` line naming the base, target and
-  unresolved CVEs;
+* logs a prominent `SECURITY-COVERAGE-GAP` line naming the base, target,
+  affected CVEs, failure stage and failure kind;
 * writes a durable record to `<state-dir>/escalation.json`; and
 * exits with status **3** (distinct from an ordinary error's `1`), so a
   systemd `OnFailure=` or timer hook can route it to alerting.
@@ -386,9 +431,41 @@ off to their own automation — for example to schedule a kernel update, drain a
 reboot into the fixed kernel. The command is invoked once per distinct gap
 (deduplicated on base/target/CVEs), receives `{base} {target} {cves} {reason}
 {report}`, and must be idempotent and return promptly. Automation of that kind
-is not yet in place, so the setting is empty (alert-only) by default. Every
-other selection, build, signing or publication failure remains an ordinary
-retained central failure with no client action.
+is not yet in place, so the setting is empty (alert-only) by default.
+
+A build-failure report subtracts the latest published same-base coverage from
+the failed job, so its CVE list contains only fixes which are genuinely
+missing. It also includes bounded diagnostics: failing ELF objects/sections
+when recognised, directly associated selected patches, the last published RPM
+and paths to retained evidence. Repeated alerts deduplicate on base, target,
+uncovered CVEs, failure stage and failure kind. Signing and publication
+failures remain ordinary retained central failures with no client action.
+
+The builder never ignores unsupported ELF changes and never rewrites a vendor
+security patch automatically. A livepatch-specific adaptation may be prepared
+and tested separately, but requires human review before publication.
+
+#### Supported livepatch-window limitation
+
+The age assigned to a fleet base is an operational ceiling, not a guarantee
+that it can remain livepatched for that whole period. Livepatchability depends
+on the exact base kernel's source and compiled objects. A fix which is already
+present or representable on one base may require unsupported section or
+relocation changes on an older base.
+
+A deterministic failure for a required Critical or Important CVE therefore
+ends the automated livepatch window for that exact base. Reconciliation retains
+the last complete published RPM, raises the coverage-gap alert and refuses
+later cumulative builds for the affected base/CVE. The operator or external
+orchestrator must then drain the fleet and reboot it onto a fixed newer base;
+the central builder does not perform that action itself.
+
+It is theoretically possible that a still-later vendor source history could
+rework or revert the problematic change and make a different aggregate patch
+representable. The terminal policy deliberately does not speculate on that
+outcome while an Important/Critical exposure remains open. Sites choosing to
+investigate such a recovery must do so as a separately reviewed exception, not
+by delaying the fleet convergence response.
 
 The design for that automation — a GitLab-driven, approval-gated fleet reboot
 orchestrator for HTCondor, including how it converges a mixed-kernel fleet — is
@@ -450,11 +527,14 @@ The resulting package:
 * uninstalls the superseded module from persistent storage during an RPM
   upgrade, after the newer cumulative module has been installed and loaded.
 
-These scriptlets and stock `kpatch-dnf` discovery have been integration-tested
-on AlmaLinux 9 with modules for installed, non-running base kernels. Signed
-publication tests cover trusted-signature and OpenPGP-header verification,
-atomic publication, immutable-object reuse and native DNF discovery without
-changing installed or loaded patch state.
+These scriptlets and stock `kpatch-dnf` discovery were field-validated on
+AlmaLinux 9.8 with a module for an installed, non-running base kernel.
+Signed publication was also field-validated with an imported disposable
+builder key: reconciliation built release `0-3`, signed it, proved both its
+trusted signature and OpenPGP header, atomically published it, and reused the
+immutable repository copy after deleting the workspace RPM. DNF with
+`gpgcheck=1` downloaded the upgrade, and native `dnf kpatch install
+--assumeno` discovered it without changing installed or loaded patch state.
 
 The ordinary test suite uses synthetic kernel fixtures but executes real
 filesystem copying, `patch`, `git`, spec evaluation and installer shell logic.

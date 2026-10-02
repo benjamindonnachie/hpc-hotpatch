@@ -8,16 +8,34 @@ ROOT_PREFIX=""
 DRY_RUN=0
 ENABLE_TIMER=0
 PROFILE="el9_8-x86_64"
+WORK_ROOT=""
+STATE_DIR=""
+REPOSITORY_ROOT=""
+BUILD_USER="klp-build"
+BUILD_GROUP="klp-build"
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--dry-run] [--root PATH] [--profile NAME] [--enable|--no-enable]
+Usage: install.sh [--dry-run] [--root PATH] [--profile NAME]
+                   [--work-root PATH] [--state-dir PATH] [--repository-root PATH]
+                   [--build-user NAME] [--build-group NAME]
+                   [--enable|--no-enable]
 
-  --dry-run    Print operations without changing the filesystem.
-  --root PATH  Install beneath PATH for packaging/tests; implies --no-enable.
-  --profile    Install/configure this systemd profile instance.
-  --enable     Validate configuration, then enable and start the timer.
-  --no-enable  Install units but do not enable or start the timer.
+  --dry-run          Print operations without changing the filesystem.
+  --root PATH        Install beneath PATH for packaging/tests; implies --no-enable.
+  --profile          Install/configure this systemd profile instance.
+  --work-root PATH   Kernel source trees, ccache, per-job build workspaces.
+                      Default: /var/lib/klp-policy/build/<profile>
+  --state-dir PATH   Registry/plan/escalation state (small, durable).
+                      Default: /var/lib/livepatch-repo/<profile>/state
+  --repository-root PATH
+                      Published RPM repository, shared across profiles.
+                      Default: /srv/klp/repo
+  --build-user NAME  System account the timer runs as. Created if missing,
+                      no login shell, no sudo rights. Default: klp-build
+  --build-group NAME Primary group for --build-user. Default: klp-build
+  --enable           Validate configuration, then enable and start the timer.
+  --no-enable        Install units but do not enable or start the timer.
 EOF
 }
 
@@ -44,6 +62,36 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-enable)
             ENABLE_TIMER=0
+            ;;
+        --work-root)
+            shift
+            [[ $# -gt 0 && "$1" == /* ]] \
+                || { echo "install.sh: --work-root requires an absolute path" >&2; exit 2; }
+            WORK_ROOT="${1%/}"
+            ;;
+        --state-dir)
+            shift
+            [[ $# -gt 0 && "$1" == /* ]] \
+                || { echo "install.sh: --state-dir requires an absolute path" >&2; exit 2; }
+            STATE_DIR="${1%/}"
+            ;;
+        --repository-root)
+            shift
+            [[ $# -gt 0 && "$1" == /* ]] \
+                || { echo "install.sh: --repository-root requires an absolute path" >&2; exit 2; }
+            REPOSITORY_ROOT="${1%/}"
+            ;;
+        --build-user)
+            shift
+            [[ $# -gt 0 && "$1" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+                || { echo "install.sh: --build-user requires a safe account name" >&2; exit 2; }
+            BUILD_USER="$1"
+            ;;
+        --build-group)
+            shift
+            [[ $# -gt 0 && "$1" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+                || { echo "install.sh: --build-group requires a safe group name" >&2; exit 2; }
+            BUILD_GROUP="$1"
             ;;
         --help|-h)
             usage
@@ -112,8 +160,14 @@ configuration_dir="$(target /etc/livepatch-repo)"
 configuration="${configuration_dir}/${PROFILE}.conf"
 environment="${configuration_dir}/${PROFILE}.env"
 unit_dir="$(target /etc/systemd/system)"
-state_root="$(target /var/lib/livepatch-repo)"
-repository_root="$(target /srv/livepatch-repo)"
+
+# Large, disposable build workspace and the small, durable state/registry
+# both default to dedicated storage outside the root filesystem; the
+# published repository is shared across profiles. All three are overridable
+# per deployment with --work-root/--state-dir/--repository-root.
+[[ -n "${WORK_ROOT}" ]] || WORK_ROOT="$(target /var/lib/klp-policy/build)/${PROFILE}"
+[[ -n "${STATE_DIR}" ]] || STATE_DIR="$(target /var/lib/livepatch-repo)/${PROFILE}/state"
+[[ -n "${REPOSITORY_ROOT}" ]] || REPOSITORY_ROOT="$(target /srv/klp)/repo"
 
 run install -d -m 0755 "${application}/livepatch_repo"
 for source in "${REPO_ROOT}"/livepatch_repo/*.py; do
@@ -131,23 +185,63 @@ else
 fi
 if [[ -e "${environment}" ]]; then
     log "preserving existing ${environment}"
+elif [[ "${DRY_RUN}" == "1" ]]; then
+    log "[DRY-RUN] would render ${environment}" \
+        "REPOSITORY_ROOT=${REPOSITORY_ROOT} WORK_ROOT=${WORK_ROOT} STATE_DIR=${STATE_DIR}"
 else
-    run install -m 0640 \
-        "${REPO_ROOT}/etc/livepatch-repo.env.example" \
-        "${environment}"
+    {
+        printf '# Rendered by install.sh on %s for profile %s.\n' \
+            "$(date -u +%FT%TZ)" "${PROFILE}"
+        printf '# Profiles for successive minor streams of one EL major/architecture\n'
+        printf '# may share REPOSITORY_ROOT; publication.lock serialises publication.\n'
+        printf 'REPOSITORY_ROOT=%s\n' "${REPOSITORY_ROOT}"
+        printf 'WORK_ROOT=%s\n' "${WORK_ROOT}"
+        printf 'STATE_DIR=%s\n' "${STATE_DIR}"
+    } | install -D -m 0640 /dev/stdin "${environment}"
 fi
 
 run install -d -m 0755 "${unit_dir}"
 for unit in livepatch-repo-refresh@.service livepatch-repo-refresh@.timer; do
-    run install -m 0644 \
-        "${REPO_ROOT}/systemd/${unit}" \
-        "${unit_dir}/${unit}"
+    if [[ "${unit}" == *.service ]]; then
+        if [[ "${DRY_RUN}" == "1" ]]; then
+            log "[DRY-RUN] would install ${unit_dir}/${unit} with User=${BUILD_USER} Group=${BUILD_GROUP}"
+        else
+            sed \
+                -e "s/^User=.*/User=${BUILD_USER}/" \
+                -e "s/^Group=.*/Group=${BUILD_GROUP}/" \
+                "${REPO_ROOT}/systemd/${unit}" \
+                | install -D -m 0644 /dev/stdin "${unit_dir}/${unit}"
+        fi
+    else
+        run install -m 0644 \
+            "${REPO_ROOT}/systemd/${unit}" \
+            "${unit_dir}/${unit}"
+    fi
 done
 
-run install -d -m 0700 \
-    "${state_root}/${PROFILE}/state" \
-    "${state_root}/${PROFILE}/jobs"
-run install -d -m 0755 "${repository_root}/alma/9/x86_64"
+run install -d -m 0750 "${STATE_DIR}"
+run install -d -m 0750 "${WORK_ROOT}"
+run install -d -m 0755 "${REPOSITORY_ROOT}"
+
+if [[ -z "${ROOT_PREFIX}" ]]; then
+    if ! getent group "${BUILD_GROUP}" >/dev/null 2>&1; then
+        run groupadd --system "${BUILD_GROUP}"
+    fi
+    if ! getent passwd "${BUILD_USER}" >/dev/null 2>&1; then
+        run useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid "${BUILD_GROUP}" \
+            --comment "livepatch-repo build account (minimal rights, no sudo)" \
+            "${BUILD_USER}"
+    fi
+    # The build account needs no elevated rights: /boot/config-* and the
+    # debuginfo vmlinux are world-readable, and rpmbuild/kpatch-build/gcc/
+    # createrepo_c only ever touch its own directories below.
+    run chown -R "${BUILD_USER}:${BUILD_GROUP}" "${STATE_DIR}" "${WORK_ROOT}" "${REPOSITORY_ROOT}"
+    # Config/env stay root-owned (the build account cannot modify its own
+    # configuration, even if compromised) but must be group-readable so the
+    # service, running as BUILD_USER, can actually load them.
+    run chgrp "${BUILD_GROUP}" "${configuration}" "${environment}"
+fi
 
 if [[ -z "${ROOT_PREFIX}" && "${ENABLE_TIMER}" == "1" ]]; then
     if [[ "${DRY_RUN}" != "1" ]]; then
@@ -157,12 +251,13 @@ import sys
 from livepatch_repo.config import load_config
 
 config = load_config(Path(sys.argv[1]))
-if config.require_rpm_signing and (
-    not config.rpm_sign_command_template
-    or not config.rpm_verify_command_template
-):
+if config.rpm_sign_command_template and not config.rpm_verify_command_template:
     raise SystemExit(
-        "signing is required but its signing or verification command is empty"
+        "an automatic signing command is configured without a verification command"
+    )
+if config.require_rpm_signing and not config.rpm_verify_command_template:
+    raise SystemExit(
+        "signing is required but no verification command is configured"
     )
 ' "${configuration}" \
             || die "configuration is not ready for timer enablement"
@@ -174,4 +269,4 @@ else
     log "timer was not enabled"
 fi
 
-log "installation complete"
+log "installation complete (work-root=${WORK_ROOT} state-dir=${STATE_DIR} repository-root=${REPOSITORY_ROOT} build-user=${BUILD_USER})"

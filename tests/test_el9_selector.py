@@ -420,6 +420,105 @@ class TestEl9Selector(unittest.TestCase):
                     },
                 )
 
+    def test_folded_source_schema_two_accepts_proven_multi_ticket_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_tree = root / "base"
+            target_tree = root / "target"
+            relative = Path("fs/shared.c")
+            (base_tree / relative).parent.mkdir(parents=True)
+            (target_tree / relative).parent.mkdir(parents=True)
+            (base_tree / relative).write_text("old\n", encoding="utf-8")
+            (target_tree / relative).write_text("fixed\n", encoding="utf-8")
+            diff = _file_diff(
+                base_tree / relative, target_tree / relative, relative.as_posix()
+            )
+            hunk = diff[diff.index("@@ ") :]
+            evidence = root / "folded-source.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "base": BASE,
+                        "target": TARGET,
+                        "groups": [
+                            {
+                                "tickets": ["RHEL-100", "RHEL-200"],
+                                "cves": ["CVE-2026-1000", "CVE-2026-2000"],
+                                "files": [
+                                    {
+                                        "path": relative.as_posix(),
+                                        "base_sha256": hashlib.sha256(
+                                            (base_tree / relative).read_bytes()
+                                        ).hexdigest(),
+                                        "target_sha256": hashlib.sha256(
+                                            (target_tree / relative).read_bytes()
+                                        ).hexdigest(),
+                                        "hunks": [_text_sha256(hunk)],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entries = (
+                ChangelogEntry(
+                    text="first fix {CVE-2026-1000} [RHEL-100]",
+                    slug="first-fix",
+                    stripped_slug="first-fix",
+                    subject_key="first-fix",
+                    cves=frozenset({"CVE-2026-1000"}),
+                    all_cves=frozenset({"CVE-2026-1000"}),
+                    tickets=frozenset({"RHEL-100"}),
+                ),
+                ChangelogEntry(
+                    text="second fix {CVE-2026-2000} [RHEL-200]",
+                    slug="second-fix",
+                    stripped_slug="second-fix",
+                    subject_key="second-fix",
+                    cves=frozenset({"CVE-2026-2000"}),
+                    all_cves=frozenset({"CVE-2026-2000"}),
+                    tickets=frozenset({"RHEL-200"}),
+                ),
+            )
+
+            groups = load_folded_source_evidence(
+                evidence,
+                base=BASE,
+                target=TARGET,
+                base_tree=base_tree,
+                target_tree=target_tree,
+                entries=entries,
+                requested_cves=frozenset(
+                    {"CVE-2026-1000", "CVE-2026-2000"}
+                ),
+                advisory_ticket_ids={},
+            )
+
+            self.assertEqual(groups[0].tickets, ("RHEL-100", "RHEL-200"))
+            self.assertEqual(groups[0].ticket, "RHEL-100+RHEL-200")
+
+            raw = json.loads(evidence.read_text(encoding="utf-8"))
+            raw["groups"][0]["tickets"] = ["RHEL-100", "RHEL-300"]
+            evidence.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "lacks changelog or advisory-ticket proof"
+            ):
+                load_folded_source_evidence(
+                    evidence,
+                    base=BASE,
+                    target=TARGET,
+                    base_tree=base_tree,
+                    target_tree=target_tree,
+                    entries=entries,
+                    requested_cves=frozenset(
+                        {"CVE-2026-1000", "CVE-2026-2000"}
+                    ),
+                    advisory_ticket_ids={},
+                )
+
     def test_rejects_source_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)

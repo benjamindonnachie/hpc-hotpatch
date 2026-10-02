@@ -7,8 +7,16 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=/opt/livepatch-repo
 EnvironmentFile=/etc/livepatch-repo/%i.env
-ExecStart=/usr/bin/python3 -m livepatch_repo reconcile --config /etc/livepatch-repo/%i.conf --state-dir /var/lib/livepatch-repo/%i/state --work-root /var/lib/livepatch-repo/%i/jobs --repository-root ${REPOSITORY_ROOT}
-User=root
-Group=root
+# STATE_DIR, WORK_ROOT and REPOSITORY_ROOT come from the environment file so
+# they can point at whatever storage the deployment chose (install.sh
+# --state-dir/--work-root/--repository-root); nothing about their location
+# is hardcoded here.
+ExecStart=/usr/bin/python3 -m livepatch_repo reconcile --config /etc/livepatch-repo/%i.conf --state-dir ${STATE_DIR} --work-root ${WORK_ROOT} --repository-root ${REPOSITORY_ROOT}
+# Overridden by install.sh at install time (--build-user/--build-group); the
+# build itself needs no elevated rights (world-readable /boot and debuginfo,
+# ordinary rpmbuild/gcc/createrepo_c against its own directories only).
+User=klp-build
+Group=klp-build
+NoNewPrivileges=yes
 UMask=0022
 TimeoutStartSec=172800

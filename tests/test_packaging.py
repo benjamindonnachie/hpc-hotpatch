@@ -67,6 +67,15 @@ class TestRpmPackaging(unittest.TestCase):
             )
             self.assertIn("/usr/bin/systemctl restart kpatch.service", spec)
             self.assertIn("Requires(post): systemd", spec)
+            self.assertIn("%posttrans", spec)
+            self.assertEqual(
+                spec.count(
+                    f"/usr/sbin/kpatch install --kernel-version "
+                    f"{self.job.base.nvra} %{{_libdir}}/kpatch/"
+                    f"{self.job.module_name}.ko"
+                ),
+                2,
+            )
             self.assertIn(
                 f"kpatch uninstall --kernel-version {self.job.base.nvra} "
                 f"{self.job.module_name}",
@@ -192,6 +201,38 @@ class TestRpmPackaging(unittest.TestCase):
                     )
                 ],
             )
+
+    def test_posttrans_repairs_same_module_name_upgrade(self) -> None:
+        post, preun = scriptlet_texts(self.job, self.job.module_name)
+        self.assertIn(f"{self.job.module_name}.ko", post)
+        self.assertIn(f" {self.job.module_name} || :", preun)
+
+        # The generated spec repeats %post as %posttrans.  Therefore an old
+        # release which uninstalls the same module name during upgrade is
+        # followed by a final install/restart of the new payload.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = root / "module.ko"
+            module.write_bytes(b"module")
+            manifest = root / "selection.json"
+            manifest.write_text("{}", encoding="utf-8")
+            inputs = prepare_rpmbuild(
+                self.job,
+                module=module,
+                selection_manifest=manifest,
+                topdir=root / "rpmbuild",
+                rpm_release=2,
+            )
+            spec = inputs.spec.read_text(encoding="utf-8")
+            posttrans = spec.split("%posttrans\n", 1)[1].split("\n%files", 1)[0]
+            self.assertIn(
+                f'[ -d "/sys/module/{self.job.module_name}" ]', posttrans
+            )
+            self.assertIn(
+                f"/usr/sbin/kpatch force unload {self.job.module_name} || :",
+                posttrans,
+            )
+            self.assertTrue(posttrans.strip().endswith(post.strip()))
 
 
 if __name__ == "__main__":

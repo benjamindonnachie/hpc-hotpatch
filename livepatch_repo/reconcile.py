@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import inspect
 import json
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -12,8 +13,12 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Config
-from .escalation import SecurityCoverageError, escalate_security_gap
-from .models import BuildJob
+from .escalation import (
+    SecurityCoverageError,
+    escalate_security_gap,
+    request_build_failure_review,
+)
+from .models import BuildJob, KernelRelease
 from .packaging import package_name, package_name_from_nvra
 from .planner import create_plan, resolve_base_kernel
 from .publication import PublicationResult, publish_repository
@@ -34,6 +39,7 @@ class ReconcileResult:
     covered: int
     no_work: int
     metadata_pending: int
+    awaiting_signature: int = 0
 
 
 def _empty_registry() -> dict[str, object]:
@@ -66,6 +72,110 @@ def _now() -> datetime:
 
 def _iso(moment: datetime) -> str:
     return moment.isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone(timezone.utc)
+
+
+def _metadata_pending_error(
+    *,
+    job: BuildJob,
+    snapshot: RepositorySnapshot,
+    state_dir: Path,
+    timeout_seconds: int,
+    now: datetime,
+) -> SecurityCoverageError:
+    path = state_dir / "metadata-pending.json"
+    signature = [job.base.nvra, job.target.nvra]
+    previous: object = None
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = None
+    first_seen = None
+    if isinstance(previous, dict) and previous.get("signature") == signature:
+        first_seen = _parse_iso(previous.get("first_seen"))
+    if first_seen is None or first_seen > now:
+        first_seen = now
+    age_seconds = max(0, int((now - first_seen).total_seconds()))
+
+    target_notices = sorted(
+        notice.advisory_id
+        for notice in snapshot.notices
+        if notice.kernel == job.target
+    )
+    security_kernels = {
+        notice.kernel
+        for notice in snapshot.notices
+        if notice.kind == "security"
+        and notice.kernel.same_family(job.base)
+        and job.base < notice.kernel
+        and (notice.kernel < job.target or notice.kernel == job.target)
+    }
+    cve_kernels = {
+        advisory.kernel
+        for advisory in snapshot.advisories
+        if advisory.kernel.same_family(job.base)
+    }
+    missing_cve_releases = sorted(
+        kernel.nvra for kernel in security_kernels - cve_kernels
+    )
+    if not target_notices:
+        pending_reason = "missing-target-updateinfo"
+        reason = (
+            f"kernel {job.target.nvra} is available but has no updateinfo "
+            "notice, so its security status cannot be determined"
+        )
+    else:
+        pending_reason = "incomplete-security-cve-data"
+        reason = (
+            "security updateinfo has no complete CVE detail for: "
+            + ", ".join(missing_cve_releases)
+        )
+
+    timed_out = age_seconds >= timeout_seconds
+    failure_kind = (
+        "repository-metadata-timeout"
+        if timed_out
+        else "repository-metadata-pending"
+    )
+    if timed_out:
+        reason += (
+            f"; metadata deadline exceeded after {age_seconds} seconds "
+            f"(limit {timeout_seconds})"
+        )
+    record = {
+        "schema_version": 1,
+        "signature": signature,
+        "base": job.base.nvra,
+        "target": job.target.nvra,
+        "first_seen": _iso(first_seen),
+        "last_seen": _iso(now),
+        "age_seconds": age_seconds,
+        "timeout_seconds": timeout_seconds,
+        "timed_out": timed_out,
+        "pending_reason": pending_reason,
+        "target_notices": target_notices,
+        "missing_cve_releases": missing_cve_releases,
+    }
+    write_json_atomic(path, record)
+    return SecurityCoverageError(
+        reason,
+        base=job.base,
+        target=job.target,
+        failure_stage="metadata",
+        failure_kind=failure_kind,
+        diagnostics={**record, "state_file": str(path)},
+    )
 
 
 def _job_signature(job: BuildJob) -> dict[str, object]:
@@ -118,6 +228,9 @@ def _compute_pinned(
     newest: dict[str, tuple[int, Path]] = {}
     for entry in jobs.values():
         if not isinstance(entry, dict):
+            continue
+        if entry.get("status") == "awaiting-signature":
+            # Not yet signed: must never be pinned into a published version.
             continue
         rpm = _registry_rpm(entry)
         if rpm is None:
@@ -201,6 +314,296 @@ def _published_coverage(
     return None
 
 
+def _latest_published_security_coverage(
+    registry: dict[str, object], job: BuildJob
+) -> tuple[set[str], dict[str, object] | None]:
+    jobs = registry["jobs"]
+    assert isinstance(jobs, dict)
+    latest: tuple[int, dict[str, object]] | None = None
+    for entry in jobs.values():
+        if not isinstance(entry, dict) or entry.get("status") != "published":
+            continue
+        signature = entry.get("signature")
+        if (
+            not isinstance(signature, dict)
+            or signature.get("base") != job.base.nvra
+            or not isinstance(signature.get("cves"), list)
+            or _registry_rpm(entry) is None
+        ):
+            continue
+        candidate = (int(entry.get("rpm_release", 0)), entry)
+        if latest is None or candidate[0] > latest[0]:
+            latest = candidate
+    if latest is None:
+        return set(), None
+    signature = latest[1]["signature"]
+    assert isinstance(signature, dict)
+    cves = signature["cves"]
+    assert isinstance(cves, list)
+    return {str(cve) for cve in cves}, latest[1]
+
+
+_CHANGED_SECTION = re.compile(
+    r"ERROR: changed section (?P<section>\S+) not selected for inclusion"
+)
+_UNSUPPORTED_OBJECT = re.compile(
+    r"ERROR: (?P<object>\S+\.o): \d+ unsupported section change\(s\)"
+)
+_TERMINAL_BUILD_FAILURE_KINDS = frozenset({"unsupported-elf-section"})
+
+
+def _build_failure_diagnostics(
+    *, job: BuildJob, workspace: Path, registry: dict[str, object], error: Exception
+) -> tuple[tuple[str, ...], str, dict[str, object]]:
+    published_cves, published_entry = _latest_published_security_coverage(
+        registry, job
+    )
+    uncovered = tuple(sorted(set(job.cves) - published_cves))
+    log_candidates = (
+        workspace / "kpatch-cache" / "build.log",
+        workspace / "build.log",
+    )
+    log = next((path for path in log_candidates if path.is_file()), None)
+    unsupported: list[dict[str, object]] = []
+    pending_sections: list[str] = []
+    if log is not None:
+        with log.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "Extracting new and modified ELF sections" in line:
+                    unsupported.clear()
+                    pending_sections.clear()
+                section_match = _CHANGED_SECTION.search(line)
+                if section_match:
+                    pending_sections.append(section_match.group("section"))
+                    continue
+                object_match = _UNSUPPORTED_OBJECT.search(line)
+                if object_match:
+                    unsupported.append(
+                        {
+                            "object": object_match.group("object"),
+                            "sections": pending_sections[-8:],
+                        }
+                    )
+                    pending_sections.clear()
+
+    selection_path = workspace / "selection.json"
+    selected_patches: list[dict[str, object]] = []
+    if selection_path.is_file():
+        try:
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            selection = None
+        if isinstance(selection, dict):
+            raw_patches = selection.get("selected_patches")
+            if isinstance(raw_patches, list):
+                for value in raw_patches:
+                    if not isinstance(value, dict):
+                        continue
+                    patch_cves = value.get("cves")
+                    if not isinstance(patch_cves, list):
+                        continue
+                    matching = sorted(set(map(str, patch_cves)) & set(uncovered))
+                    if matching and isinstance(value.get("patch"), str):
+                        selected_patches.append(
+                            {"patch": value["patch"], "cves": matching}
+                        )
+
+    failure_kind = (
+        "unsupported-elf-section" if unsupported else "livepatch-build-failure"
+    )
+    object_names = ", ".join(
+        str(value["object"]) for value in unsupported
+    )
+    if object_names:
+        reason = (
+            "kpatch cannot safely represent required security fixes: "
+            f"unsupported ELF section changes in {object_names}"
+        )
+    else:
+        reason = f"livepatch build failed: {error}"
+
+    severity = {
+        decision.cve: decision.severity
+        for decision in job.cve_policy_decisions
+        if decision.cve in uncovered
+    }
+    published: dict[str, object] | None = None
+    if published_entry is not None:
+        signature = published_entry.get("signature")
+        published = {
+            "target": (
+                signature.get("target") if isinstance(signature, dict) else None
+            ),
+            "cves": sorted(published_cves),
+            "rpm_release": published_entry.get("rpm_release"),
+            "rpm": str(_registry_rpm(published_entry)),
+        }
+    diagnostics: dict[str, object] = {
+        "job_id": job.job_id,
+        "backend": job.backend,
+        "error": str(error),
+        "uncovered_cve_severity": severity,
+        "unsupported_changes": unsupported,
+        "selected_patches": selected_patches,
+        "last_published_coverage": published,
+        "evidence": {
+            "workspace": str(workspace),
+            "selection_manifest": str(selection_path),
+            "aggregate_patch": str(workspace / "source.patch"),
+            "build_log": str(log) if log is not None else None,
+        },
+    }
+    return uncovered, failure_kind, {"reason": reason, **diagnostics}
+
+
+def _target_is_at_or_after(failed_target: object, job: BuildJob) -> bool:
+    if not isinstance(failed_target, str):
+        return False
+    try:
+        return KernelRelease.from_uname(failed_target) <= job.target
+    except ValueError:
+        return False
+
+
+def _terminal_build_gap(
+    registry: dict[str, object], job: BuildJob, state_dir: Path
+) -> dict[str, object] | None:
+    """Find a proven same-base livepatchability gap inherited by ``job``.
+
+    Only explicitly classified, deterministic kpatch limitations are terminal.
+    Generic build failures remain retryable.  The escalation-file fallback
+    recognises failures recorded before terminal metadata was added to the
+    registry, provided the referenced failed job is still retained.
+    """
+    required = set(job.cves)
+    published_cves, _published_entry = _latest_published_security_coverage(
+        registry, job
+    )
+    jobs = registry["jobs"]
+    assert isinstance(jobs, dict)
+    candidates: list[dict[str, object]] = []
+    for failed_job_id, entry in jobs.items():
+        if not isinstance(entry, dict) or entry.get("status") != "failed":
+            continue
+        signature = entry.get("signature")
+        failure_kind = entry.get("failure_kind")
+        uncovered = entry.get("uncovered_cves")
+        if (
+            not isinstance(signature, dict)
+            or signature.get("base") != job.base.nvra
+            or failure_kind not in _TERMINAL_BUILD_FAILURE_KINDS
+            or not isinstance(uncovered, list)
+            or not _target_is_at_or_after(signature.get("target"), job)
+        ):
+            continue
+        terminal_cves = {str(cve) for cve in uncovered} - published_cves
+        inherited = sorted(required & terminal_cves if required else terminal_cves)
+        if inherited:
+            candidates.append(
+                {
+                    "failed_job_id": str(failed_job_id),
+                    "failed_target": signature.get("target"),
+                    "failure_kind": failure_kind,
+                    "cves": inherited,
+                    "diagnostics": entry.get("failure_diagnostics", {}),
+                    "source": "registry",
+                }
+            )
+
+    if not candidates:
+        escalation_path = state_dir / "escalation.json"
+        try:
+            report = json.loads(escalation_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report = None
+        if isinstance(report, dict):
+            diagnostics = report.get("diagnostics")
+            failed_job_id = (
+                diagnostics.get("job_id")
+                if isinstance(diagnostics, dict)
+                else None
+            )
+            failed_entry = jobs.get(failed_job_id)
+            report_cves = report.get("cves")
+            if (
+                report.get("failure_stage") == "build"
+                and report.get("failure_kind")
+                in _TERMINAL_BUILD_FAILURE_KINDS
+                and report.get("base") == job.base.nvra
+                and isinstance(failed_job_id, str)
+                and isinstance(failed_entry, dict)
+                and failed_entry.get("status") == "failed"
+                and isinstance(report_cves, list)
+                and _target_is_at_or_after(report.get("target"), job)
+            ):
+                terminal_cves = {
+                    str(cve) for cve in report_cves
+                } - published_cves
+                inherited = sorted(
+                    required & terminal_cves if required else terminal_cves
+                )
+                if inherited:
+                    candidates.append(
+                        {
+                            "failed_job_id": failed_job_id,
+                            "failed_target": report.get("target"),
+                            "failure_kind": report.get("failure_kind"),
+                            "cves": inherited,
+                            "diagnostics": diagnostics,
+                            "source": "escalation-record",
+                        }
+                    )
+
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda value: KernelRelease.from_uname(str(value["failed_target"])),
+    )
+
+
+def _terminal_gap_error(
+    job: BuildJob, terminal_gap: dict[str, object]
+) -> SecurityCoverageError:
+    gap_cves = tuple(str(cve) for cve in terminal_gap["cves"])
+    original_diagnostics = terminal_gap.get("diagnostics")
+    severity = {
+        decision.cve: decision.severity
+        for decision in job.cve_policy_decisions
+        if decision.cve in gap_cves
+    }
+    if not severity and isinstance(original_diagnostics, dict):
+        original_severity = original_diagnostics.get("uncovered_cve_severity")
+        if isinstance(original_severity, dict):
+            severity = {
+                str(cve): str(value)
+                for cve, value in original_severity.items()
+                if str(cve) in gap_cves
+            }
+    return SecurityCoverageError(
+        "required security fixes are already proven unpatchable "
+        f"for base {job.base.nvra}; refusing a redundant build",
+        base=job.base,
+        target=job.target,
+        cves=gap_cves,
+        failure_stage="build",
+        failure_kind="inherited-terminal-build-gap",
+        diagnostics={
+            "build_skipped": True,
+            "failed_job_id": terminal_gap["failed_job_id"],
+            "failed_target": terminal_gap["failed_target"],
+            "original_failure_kind": terminal_gap["failure_kind"],
+            "uncovered_cve_severity": severity,
+            "source": terminal_gap["source"],
+            "original_diagnostics": (
+                original_diagnostics
+                if isinstance(original_diagnostics, dict)
+                else {}
+            ),
+        },
+    )
+
+
 def _backfill_patch_digests(
     registry: dict[str, object], work_root: Path
 ) -> bool:
@@ -275,16 +678,7 @@ def _run_rpm_command(path: Path, template: str, description: str) -> None:
         raise ValueError(f"RPM {description} failed: {error}") from error
 
 
-def _sign_and_verify_rpm(
-    path: Path,
-    sign_template: str,
-    verify_template: str,
-    rpm_command: str,
-) -> None:
-    if not verify_template:
-        raise ValueError("RPM signature verification command is empty")
-    _run_rpm_command(path, sign_template, "signing")
-    _run_rpm_command(path, verify_template, "signature verification")
+def _rpm_has_signature(path: Path, rpm_command: str) -> bool:
     try:
         completed = subprocess.run(
             [
@@ -306,13 +700,57 @@ def _sign_and_verify_rpm(
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError(f"RPM signature-header query failed: {error}") from error
-    signatures = {
-        line.strip()
+    return any(
+        line.strip() and line.strip() != "(none)"
         for line in completed.stdout.splitlines()
-        if line.strip() and line.strip() != "(none)"
-    }
-    if not signatures:
+    )
+
+
+def _sign_and_verify_rpm(
+    path: Path,
+    sign_template: str,
+    verify_template: str,
+    rpm_command: str,
+) -> None:
+    if not verify_template:
+        raise ValueError("RPM signature verification command is empty")
+    _run_rpm_command(path, sign_template, "signing")
+    _run_rpm_command(path, verify_template, "signature verification")
+    if not _rpm_has_signature(path, rpm_command):
         raise ValueError("RPM has no OpenPGP signature header after signing")
+
+
+def _promote_signed_entries(registry: dict[str, object], config: Config) -> int:
+    """Promote 'awaiting-signature' entries once an operator has manually
+    signed the RPM in place.
+
+    This is the manual-signing counterpart to `_sign_and_verify_rpm`: when
+    `require_rpm_signing` is set but no `rpm_sign_command_template` is
+    configured, `reconcile_repository` builds and packages a job as normal
+    but holds it as 'awaiting-signature' rather than publishing it unsigned.
+    An operator signs the RPM at its registry-recorded path out of band
+    (e.g. `rpm --addsign`); the next reconcile run notices the signature
+    here and hands the entry back to the ordinary 'built' -> publish path.
+    """
+    jobs = registry["jobs"]
+    assert isinstance(jobs, dict)
+    promoted = 0
+    for entry in jobs.values():
+        if not isinstance(entry, dict) or entry.get("status") != "awaiting-signature":
+            continue
+        rpm = _registry_rpm(entry)
+        if rpm is None or not rpm.is_file():
+            continue
+        if not _rpm_has_signature(rpm, config.rpm_command):
+            continue
+        if config.rpm_verify_command_template:
+            _run_rpm_command(
+                rpm, config.rpm_verify_command_template, "signature verification"
+            )
+        entry["status"] = "built"
+        entry.pop("error", None)
+        promoted += 1
+    return promoted
 
 
 def reconcile_repository(
@@ -361,8 +799,13 @@ def reconcile_repository(
         )
         write_json_atomic(state_dir / "snapshot.json", live_snapshot.to_dict())
         write_json_atomic(state_dir / "plan.json", plan.to_dict())
+        metadata_pending_path = state_dir / "metadata-pending.json"
+        if not any(job.status == "metadata-pending" for job in plan.jobs):
+            metadata_pending_path.unlink(missing_ok=True)
         registry_path = state_dir / "registry.json"
         registry = _read_registry(registry_path)
+        if _promote_signed_entries(registry, config):
+            write_json_atomic(registry_path, registry)
         if _backfill_patch_digests(registry, work_root):
             write_json_atomic(registry_path, registry)
         now = _now()
@@ -391,12 +834,29 @@ def reconcile_repository(
             tuple[BuildJob, dict[str, object], Path]
         ] = []
         for job in plan.jobs:
+            terminal_gap = _terminal_build_gap(registry, job, state_dir)
+            if terminal_gap is not None and job.status != "planned":
+                coverage_error = _terminal_gap_error(job, terminal_gap)
+                escalate_security_gap(
+                    config=config, state_dir=state_dir, error=coverage_error
+                )
+                raise coverage_error
             if job.status == "no-work":
                 no_work += 1
                 continue
             if job.status == "metadata-pending":
                 metadata_pending += 1
-                continue
+                coverage_error = _metadata_pending_error(
+                    job=job,
+                    snapshot=live_snapshot,
+                    state_dir=state_dir,
+                    timeout_seconds=config.metadata_pending_timeout_seconds,
+                    now=now,
+                )
+                escalate_security_gap(
+                    config=config, state_dir=state_dir, error=coverage_error
+                )
+                raise coverage_error
             coverage = _published_coverage(registry, job)
             if coverage is not None:
                 covered_by, published_entry = coverage
@@ -413,16 +873,21 @@ def reconcile_repository(
                 write_json_atomic(registry_path, registry)
                 covered += 1
                 continue
-            if (
-                config.require_rpm_signing
-                and (
-                    not config.rpm_sign_command_template
-                    or not config.rpm_verify_command_template
+            if terminal_gap is not None:
+                coverage_error = _terminal_gap_error(job, terminal_gap)
+                escalate_security_gap(
+                    config=config, state_dir=state_dir, error=coverage_error
                 )
-            ):
+                raise coverage_error
+            if config.rpm_sign_command_template and not config.rpm_verify_command_template:
+                # An automatic signer without a verifier can't prove its own
+                # output is trustworthy -- fail before burning a build on it.
+                # No sign template at all is a supported, deliberate
+                # configuration: require_rpm_signing then holds completed
+                # builds as 'awaiting-signature' for manual signing instead.
                 raise ValueError(
-                    "RPM signing is required but its signing or verification "
-                    "command template is empty"
+                    "RPM signing command is configured without a "
+                    "verification command template"
                 )
             entry, rpm_release = _allocate_release(registry, job)
             if (
@@ -444,7 +909,7 @@ def reconcile_repository(
         # for a single build: kpatch-build truncates its cache build.log and
         # patches its --sourcedir in place, so it must never run against the
         # shared cache or the immutable prepared source.
-        build_errors: list[tuple[str, Exception]] = []
+        build_errors: list[tuple[BuildJob, Exception]] = []
         for job, entry, rpm_release in pending_builds:
             try:
                 build_options: dict[str, object] = {
@@ -508,20 +973,71 @@ def reconcile_repository(
                 entry["rpm"] = str(rpm)
                 if result.patch_sha256 is not None:
                     entry["patch_sha256"] = result.patch_sha256
-                entry.pop("error", None)
+                for key in (
+                    "error",
+                    "failure_stage",
+                    "failure_kind",
+                    "uncovered_cves",
+                    "terminal_for_base",
+                    "failure_diagnostics",
+                ):
+                    entry.pop(key, None)
                 completed_builds.append((job, entry, rpm))
                 built_count += 1
             except Exception as error:
                 entry["status"] = "failed"
                 entry["error"] = str(error)
-                build_errors.append((job.job_id, error))
+                build_errors.append((job, error))
             write_json_atomic(registry_path, registry)
 
         if build_errors:
             details = "; ".join(
-                f"{job_id}: {error}" for job_id, error in build_errors
+                f"{job.job_id}: {error}" for job, error in build_errors
             )
-            raise ValueError(f"one or more livepatch builds failed: {details}")
+            failed_job, build_error = build_errors[0]
+            uncovered, failure_kind, diagnostics = _build_failure_diagnostics(
+                job=failed_job,
+                workspace=work_root / failed_job.job_id,
+                registry=registry,
+                error=build_error,
+            )
+            reason = str(diagnostics.pop("reason"))
+            if len(build_errors) > 1:
+                diagnostics["all_build_failures"] = details
+            coverage_error = SecurityCoverageError(
+                reason,
+                base=failed_job.base,
+                target=failed_job.target,
+                cves=uncovered,
+                failure_stage="build",
+                failure_kind=failure_kind,
+                diagnostics=diagnostics,
+            )
+            jobs = registry["jobs"]
+            assert isinstance(jobs, dict)
+            failed_entry = jobs.get(failed_job.job_id)
+            if isinstance(failed_entry, dict):
+                failed_entry["failure_stage"] = "build"
+                failed_entry["failure_kind"] = failure_kind
+                failed_entry["uncovered_cves"] = list(uncovered)
+                failed_entry["terminal_for_base"] = (
+                    failure_kind in _TERMINAL_BUILD_FAILURE_KINDS
+                )
+                failed_entry["failure_diagnostics"] = diagnostics
+                write_json_atomic(registry_path, registry)
+            terminal = failure_kind in _TERMINAL_BUILD_FAILURE_KINDS
+            review = (
+                {"under_review": False, "expired": True}
+                if terminal
+                else request_build_failure_review(
+                    config=config, state_dir=state_dir, error=coverage_error, now=now
+                )
+            )
+            if not review["under_review"]:
+                escalate_security_gap(
+                    config=config, state_dir=state_dir, error=coverage_error
+                )
+            raise coverage_error
 
         if completed_builds:
             repository_root.mkdir(parents=True, exist_ok=True)
@@ -537,7 +1053,15 @@ def reconcile_repository(
                                 config.rpm_verify_command_template,
                                 config.rpm_command,
                             )
-                        entry["status"] = "built"
+                            entry["status"] = "built"
+                        elif config.require_rpm_signing:
+                            # Built and packaged, but signing is manual: hold
+                            # here until an operator signs the RPM in place
+                            # and a later reconcile run promotes it (see
+                            # _promote_signed_entries).
+                            entry["status"] = "awaiting-signature"
+                        else:
+                            entry["status"] = "built"
                         entry.pop("error", None)
                     except Exception as error:
                         entry["status"] = "failed"
@@ -606,6 +1130,11 @@ def reconcile_repository(
                     published += 1
             registry["published_pin_names"] = desired_pin_names
             write_json_atomic(registry_path, registry)
+        awaiting_signature = sum(
+            1
+            for entry in jobs.values()
+            if isinstance(entry, dict) and entry.get("status") == "awaiting-signature"
+        )
         return ReconcileResult(
             target=plan.target.nvra if plan.target is not None else plan.base.nvra,
             built=built_count,
@@ -613,4 +1142,5 @@ def reconcile_repository(
             covered=covered,
             no_work=no_work,
             metadata_pending=metadata_pending,
+            awaiting_signature=awaiting_signature,
         )

@@ -1,39 +1,64 @@
-# Escalation ticket contract (central → GitLab)
+# Escalation ticket contract (central → GitLab / webhook / email)
 
-The versioned handoff between the central builder's security-coverage escalation
-and the fleet reboot orchestrator. Implemented by
+The versioned handoff between the central builder's escalation hooks and
+whatever downstream system acts on them: the fleet reboot orchestrator, an
+on-call webhook, or a plain email alert. Implemented by
 `livepatch_repo/escalation_ticket.py`; the orchestrator design is in
 [`escalation-orchestrator.md`](escalation-orchestrator.md).
 
 The central builder performs no client action. It only emits a ticket and,
-when configured, triggers a GitLab pipeline. Everything after that is the
-approve-gated orchestrator's responsibility.
+when configured, delivers it over one or more channels. Everything after
+that is the receiving system's responsibility -- for the fleet-reboot ticket
+kind specifically, that means the approve-gated orchestrator.
 
-## Wiring
+## Two hooks, one tool
 
-Point the escalation hook at the ticket tool:
+`escalation_ticket.py` is the reference target for **two** independent config
+hooks, distinguished by the ticket `kind` it derives from the report:
 
 ```ini
 [policy]
+# Fires immediately on a security-coverage gap, or once build-failure review
+# (below) is unconfigured/exhausted. Ticket kind: fleet-reboot-request.
 security_escalation_command_template = python3 -m livepatch_repo.escalation_ticket --report {report}
+
+# Optional. Fires first, before a build failure reaches the line above, so an
+# operator-scoped review (e.g. an agent working under human guidance) gets a
+# chance to fix it. Ticket kind: build-failure-review-request. Must return
+# promptly -- it is a trigger, not the review itself, exactly like the row
+# above. Reconcile holds off re-escalating the same failure for
+# build_failure_review_grace_seconds (default 86400) while retrying the build
+# on each tick; if the review's fix lands, the next build just succeeds and
+# nothing further is sent. Left empty (the default), build failures escalate
+# immediately, same as before this hook existed.
+build_failure_review_command_template = python3 -m livepatch_repo.escalation_ticket --report {report}
+build_failure_review_timeout_seconds = 300
+build_failure_review_grace_seconds = 86400
 ```
 
-`{report}` is the path to `<state-dir>/escalation.json`, which reconciliation
-writes before invoking the hook. GitLab configuration comes from the
-environment (e.g. the reconcile unit's `EnvironmentFile`), never the config
-template, so the trigger token is not stored beside ordinary settings:
+`{report}` is the path to the JSON record reconciliation writes before
+invoking the hook (`<state-dir>/escalation.json` or
+`<state-dir>/build-failure-review.json`).
+
+## Delivery channels
+
+Each channel is independent and optional; configure any combination. None of
+this is stored in the config template -- it comes from the environment (e.g.
+the reconcile unit's `EnvironmentFile`), so secrets stay out of ordinary
+settings:
 
 | Variable | Meaning |
 |---|---|
-| `GITLAB_URL` | Base URL, e.g. `https://gitlab.example.com`. |
-| `GITLAB_PROJECT_ID` | Numeric project id of the orchestrator repo. |
-| `GITLAB_TRIGGER_TOKEN` | Pipeline trigger token (a **secret**). |
-| `GITLAB_REF` | Branch/tag to run (default `main`). |
+| `GITLAB_URL` / `GITLAB_PROJECT_ID` / `GITLAB_TRIGGER_TOKEN` / `GITLAB_REF` | Trigger a GitLab pipeline (the fleet-reboot orchestrator's transport). `GITLAB_REF` defaults to `main`. |
+| `ALERT_WEBHOOK_URL` / `ALERT_WEBHOOK_HEADER` | POST the ticket as JSON to a generic webhook. `ALERT_WEBHOOK_HEADER` is one optional `"Name: value"` header (e.g. an API key). |
+| `ALERT_EMAIL_TO` / `ALERT_EMAIL_FROM` / `ALERT_SMTP_HOST` / `ALERT_SMTP_PORT` | Send a plain-text alert email. `ALERT_SMTP_PORT` defaults to 25. |
 
 **With none set, the tool is a safe no-op:** it prints the ticket and sends
 nothing, so an unconfigured deployment stays alert-only and the reconcile does
-not fail. A configured send that fails returns non-zero, so the escalation
-records a `command_error` and retries on the next run.
+not fail. Each configured channel is attempted independently; a channel that
+fails to send returns a non-zero exit and its own `_error` detail, so the
+escalation records it and retries that channel on the next run without
+blocking the others.
 
 ## Ticket schema (v1)
 
@@ -46,24 +71,42 @@ records a `command_error` and retries on the next run.
   "target": "5.14.0-687.25.1.el9_8.x86_64",
   "cves": ["CVE-2026-40001", "CVE-2026-40002"],
   "reason": "security data has no severity for: CVE-2026-40001",
+  "diagnostics": {},
   "source": {
     "system": "central-livepatch-repo",
     "report_kind": "security-coverage-gap",
-    "raised_at": "2026-07-19T16:00:00Z"
+    "raised_at": "2026-07-19T16:00:00Z",
+    "failure_stage": "classification",
+    "failure_kind": "unresolved-security-data"
   }
 }
 ```
 
+- **`kind`** — `fleet-reboot-request` for a security-coverage gap or an
+  exhausted build-failure review; `build-failure-review-request` when the
+  report's own `kind` is `build-failure-review` (a fresh, not-yet-exhausted
+  build failure being handed to review first).
 - **`ticket_id`** — `sha256(base \0 target \0 sorted(cves))[:16]`. Stable and
   order-independent: the same gap always yields the same id, so the orchestrator
-  can **deduplicate** repeated triggers (matching the escalation record's own
-  dedup signature). A changed CVE set yields a new id.
+  can **deduplicate** repeated triggers. The central alert record additionally
+  includes failure stage and kind in its notification signature, so a later
+  build-stage failure can still alert after an earlier metadata-stage warning;
+  both fold into the same approval ticket when base, target and CVEs match.
 - **`base` / `target`** — the exposed base kernel and the convergence target the
   fleet should reach. The orchestrator drives *every node not already on
   `target`* onto it (see the mixed-fleet section of the orchestrator doc).
-- **`cves`** — sorted, normalised; the required security fixes the missing
-  livepatch would have carried.
+- **`cves`** — sorted and normalised. For classification/build gaps these are
+  the required fixes the missing livepatch would have carried. The list is
+  empty for a newly available kernel whose updateinfo is not yet sufficient to
+  determine whether any CVE exists; `source.failure_kind` and `diagnostics`
+  carry the pending/timeout condition instead.
 - **`reason`** — human-readable cause (the escalation message).
+- **`diagnostics`** — additive structured evidence. For a metadata gap this
+  includes `first_seen`, age, timeout, available target notices and missing CVE
+  releases. For a build-stage gap it includes the job/backend, unsupported ELF
+  objects and sections when recognised, selected patches associated with newly
+  uncovered CVEs, the last published same-base coverage, and retained evidence
+  paths.
 - **`source`** — provenance for audit; not authoritative.
 
 ## GitLab trigger mapping

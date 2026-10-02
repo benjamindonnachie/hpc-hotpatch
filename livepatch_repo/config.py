@@ -44,6 +44,10 @@ class Config:
     )
     security_escalation_command_template: str = ""
     security_escalation_timeout_seconds: int = 300
+    metadata_pending_timeout_seconds: int = 86400
+    build_failure_review_command_template: str = ""
+    build_failure_review_timeout_seconds: int = 300
+    build_failure_review_grace_seconds: int = 86400
 
 
 def load_config(path: Path) -> Config:
@@ -102,6 +106,26 @@ def load_config(path: Path) -> Config:
                 "policy",
                 "security_escalation_timeout_seconds",
                 fallback=300,
+            ),
+            metadata_pending_timeout_seconds=parser.getint(
+                "policy",
+                "metadata_pending_timeout_seconds",
+                fallback=86400,
+            ),
+            build_failure_review_command_template=parser.get(
+                "policy",
+                "build_failure_review_command_template",
+                fallback="",
+            ).strip(),
+            build_failure_review_timeout_seconds=parser.getint(
+                "policy",
+                "build_failure_review_timeout_seconds",
+                fallback=300,
+            ),
+            build_failure_review_grace_seconds=parser.getint(
+                "policy",
+                "build_failure_review_grace_seconds",
+                fallback=86400,
             ),
             selector_command_template=parser.get(
                 "builders", "selector_command_template", fallback=""
@@ -188,6 +212,21 @@ def load_config(path: Path) -> Config:
                 1,
             ),
             (
+                "metadata_pending_timeout_seconds",
+                config.metadata_pending_timeout_seconds,
+                1,
+            ),
+            (
+                "build_failure_review_timeout_seconds",
+                config.build_failure_review_timeout_seconds,
+                1,
+            ),
+            (
+                "build_failure_review_grace_seconds",
+                config.build_failure_review_grace_seconds,
+                0,
+            ),
+            (
                 "termination_grace_seconds",
                 config.command_termination_grace_seconds,
                 0,
@@ -203,7 +242,18 @@ def load_config(path: Path) -> Config:
             raise ValueError("cve_severity_url_template must contain {cves}")
         if not config.cve_severity_url_template.startswith("https://"):
             raise ValueError("cve_severity_url_template must use HTTPS")
-        if config.security_escalation_command_template:
+        for label, template in (
+            (
+                "security_escalation_command_template",
+                config.security_escalation_command_template,
+            ),
+            (
+                "build_failure_review_command_template",
+                config.build_failure_review_command_template,
+            ),
+        ):
+            if not template:
+                continue
             import shlex
 
             sample = {
@@ -214,14 +264,11 @@ def load_config(path: Path) -> Config:
                 "report": "",
             }
             try:
-                for token in shlex.split(
-                    config.security_escalation_command_template
-                ):
+                for token in shlex.split(template):
                     token.format_map(sample)
             except (KeyError, ValueError) as error:
                 raise ValueError(
-                    "security_escalation_command_template has an unknown or "
-                    f"malformed placeholder: {error}"
+                    f"{label} has an unknown or malformed placeholder: {error}"
                 )
         return config
     except (configparser.Error, ValueError) as error:

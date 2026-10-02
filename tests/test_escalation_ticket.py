@@ -51,6 +51,23 @@ class TestTicketConstruction(unittest.TestCase):
         with self.assertRaises(ValueError):
             et.build_ticket({**_REPORT, "cves": "not-a-list"})
 
+    def test_build_failure_diagnostics_are_forwarded(self) -> None:
+        report = {
+            **_REPORT,
+            "failure_stage": "build",
+            "failure_kind": "unsupported-elf-section",
+            "diagnostics": {"unsupported_changes": [{"object": "futex.o"}]},
+        }
+        ticket = et.build_ticket(report)
+        self.assertEqual(ticket["source"]["failure_stage"], "build")
+        self.assertEqual(
+            ticket["source"]["failure_kind"], "unsupported-elf-section"
+        )
+        self.assertEqual(
+            ticket["diagnostics"]["unsupported_changes"][0]["object"],
+            "futex.o",
+        )
+
 
 class TestTriggerRequest(unittest.TestCase):
     def test_request_url_and_form(self) -> None:
@@ -95,7 +112,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(code, 0)
             emitted = json.loads(out.getvalue())
             self.assertFalse(emitted["sent"])
-            self.assertIn("not configured", err.getvalue())
+            self.assertIn("no delivery channel configured", err.getvalue())
 
     def test_configured_sends_trigger(self) -> None:
         sent = {}
@@ -165,6 +182,86 @@ class TestCli(unittest.TestCase):
                     sender=exploding_sender,
                 )
             self.assertEqual(code, 0)
+
+    def test_webhook_channel_sends_json_ticket(self) -> None:
+        sent = {}
+
+        def fake_sender(request):
+            sent["url"] = request.full_url
+            sent["headers"] = request.headers
+            sent["body"] = json.loads(request.data.decode())
+            return ""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = self._report_file(Path(temporary))
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = et.main(
+                    [
+                        "--report", str(report),
+                        "--webhook-url", "https://hooks.example.com/alert",
+                        "--webhook-header", "X-Api-Key: secret",
+                    ],
+                    sender=fake_sender,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(sent["url"], "https://hooks.example.com/alert")
+            self.assertEqual(sent["headers"]["X-api-key"], "secret")
+            self.assertEqual(sent["body"]["base"], _REPORT["base"])
+            emitted = json.loads(out.getvalue())
+            self.assertTrue(emitted["sent"])
+            self.assertTrue(emitted["channels"]["webhook"])
+
+    def test_email_channel_sends_message(self) -> None:
+        sent = {}
+
+        class FakeSmtp:
+            def send_message(self, message):
+                sent["to"] = message["To"]
+                sent["subject"] = message["Subject"]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = self._report_file(Path(temporary))
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = et.main(
+                    [
+                        "--report", str(report),
+                        "--email-to", "oncall@example.com",
+                        "--smtp-host", "mail.example.com",
+                    ],
+                    smtp_client=lambda: FakeSmtp(),
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(sent["to"], "oncall@example.com")
+            self.assertIn("fleet-reboot-request", sent["subject"])
+            emitted = json.loads(out.getvalue())
+            self.assertTrue(emitted["channels"]["email"])
+
+    def test_multiple_channels_can_fire_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = self._report_file(Path(temporary))
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = et.main(
+                    [
+                        "--report", str(report),
+                        "--gitlab-url", "https://gitlab.example.com",
+                        "--project-id", "42",
+                        "--trigger-token", "secret",
+                        "--webhook-url", "https://hooks.example.com/alert",
+                    ],
+                    sender=lambda request: "",
+                )
+            self.assertEqual(code, 0)
+            emitted = json.loads(out.getvalue())
+            self.assertTrue(emitted["channels"]["gitlab"])
+            self.assertTrue(emitted["channels"]["webhook"])
+
+    def test_review_report_kind_becomes_review_request_ticket(self) -> None:
+        review_report = {**_REPORT, "kind": "build-failure-review"}
+        ticket = et.build_ticket(review_report)
+        self.assertEqual(ticket["kind"], "build-failure-review-request")
 
 
 if __name__ == "__main__":

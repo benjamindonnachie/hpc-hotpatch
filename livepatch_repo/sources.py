@@ -30,6 +30,10 @@ TICKET_ID_RE = re.compile(
     r"(?:JIRA:AlmaLinux-|(?:JIRA:)?RHEL-)(?P<ticket>[0-9]+)",
     re.IGNORECASE,
 )
+RED_HAT_VEX_URL_TEMPLATE = (
+    "https://security.access.redhat.com/data/csaf/v2/vex-feed/"
+    "{year}/{cve_lower}.json"
+)
 
 
 @dataclass(frozen=True)
@@ -400,7 +404,10 @@ def associate_local_advisory_ids(
 
 
 def parse_cve_severities(
-    output: str, expected_cves: tuple[str, ...]
+    output: str,
+    expected_cves: tuple[str, ...],
+    *,
+    require_complete: bool = True,
 ) -> dict[str, str]:
     try:
         value = json.loads(output)
@@ -426,12 +433,40 @@ def parse_cve_severities(
             )
         result[cve] = severity
     missing = sorted(expected - set(result))
-    if missing:
+    if missing and require_complete:
         raise SecurityCoverageError(
             "security data has no severity for: " + ", ".join(missing),
             cves=tuple(missing),
         )
     return result
+
+
+def parse_cve_vex_severity(output: str, expected_cve: str) -> str:
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ValueError("invalid CVE VEX security data") from error
+    if not isinstance(value, dict):
+        raise ValueError("CVE VEX security data is not an object")
+    document = value.get("document")
+    if not isinstance(document, dict):
+        raise ValueError("CVE VEX security data has no document")
+    tracking = document.get("tracking")
+    actual_cve = tracking.get("id") if isinstance(tracking, dict) else None
+    if str(actual_cve).upper() != expected_cve.upper():
+        raise ValueError(f"unexpected CVE in VEX security data: {actual_cve!r}")
+    aggregate = document.get("aggregate_severity")
+    severity = (
+        str(aggregate.get("text", "")).strip().title()
+        if isinstance(aggregate, dict)
+        else ""
+    )
+    if severity not in {"Critical", "Important", "Moderate", "Low"}:
+        raise SecurityCoverageError(
+            f"VEX security data has no recognised severity for {expected_cve}",
+            cves=(expected_cve,),
+        )
+    return severity
 
 
 class DnfRepositorySource:
@@ -479,7 +514,25 @@ class DnfRepositorySource:
                 raise ValueError(
                     "could not fetch individual CVE severities: " + str(error)
                 ) from error
-            result.update(parse_cve_severities(payload, chunk))
+            result.update(
+                parse_cve_severities(payload, chunk, require_complete=False)
+            )
+        for cve in sorted(set(cves) - set(result)):
+            year = cve.split("-", 2)[1]
+            url = RED_HAT_VEX_URL_TEMPLATE.format(
+                year=year,
+                cve_lower=cve.lower(),
+            )
+            request = Request(url, headers={"User-Agent": "livepatch-repo/1"})
+            try:
+                with urlopen(request, timeout=30) as response:
+                    payload = response.read().decode("utf-8")
+            except OSError as error:
+                raise SecurityCoverageError(
+                    f"security data has no severity for: {cve}",
+                    cves=(cve,),
+                ) from error
+            result[cve] = parse_cve_vex_severity(payload, cve)
         return result
 
     def collect(self) -> RepositorySnapshot:

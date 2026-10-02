@@ -34,6 +34,30 @@ also requires a non-empty RSA/DSA/OpenPGP RPM signature header. The header
 check is mandatory because `rpmkeys --checksig` returns success for an
 unsigned package whose file digests are valid.
 
+### Manual signing hold
+
+Everything up to signing is autonomous by design; signing itself is the one
+step intentionally left to an operator (a private signing key has no business
+being reachable from an unattended timer). With `require_rpm_signing = true`
+and `rpm_sign_command_template` left empty (the shipped default), reconcile
+still scans, plans, builds and packages jobs on its own timer, but a
+completed build is held with registry status `awaiting-signature` rather than
+published. It is skipped when computing which RPMs to pin into a published
+version, so an unsigned package can never reach the repository even
+transiently.
+
+An operator signs the RPM in place at its registry-recorded (`rpm`) path —
+e.g. `rpmsign --addsign <path>` — with no other tooling involved. The next
+reconcile run (the existing hourly refresh timer; no separate command or
+timer is needed) detects the new signature header, runs the configured
+`rpm_verify_command_template` against it, and on success promotes the entry
+to `built` so the normal publish path picks it up on that same run. If the
+verification command rejects it, the run fails loudly (same as the automatic
+signing path) rather than silently leaving it unpublished. If an RPM is
+still unsigned, the run simply reports it under `awaiting-signature` and
+continues to the next timer tick — this is a routine, expected hold, not an
+escalation.
+
 The package exposes the virtual provide and dependency used by native
 subscription and kernel-filtering tooling:
 

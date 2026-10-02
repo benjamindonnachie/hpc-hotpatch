@@ -30,18 +30,46 @@ cve_severity_url_template = https://access.redhat.com/hydra/rest/securitydata/cv
 # return promptly (e.g. enqueue a job). Placeholders: {base} {target} {cves}
 # {reason} {report}. Automation is not yet in place, so this is left empty.
 #
-# Reference hand-off to the GitLab reboot orchestrator (see
-# docs/escalation-ticket-contract.md). GitLab settings come from the unit's
-# environment (GITLAB_URL, GITLAB_PROJECT_ID, GITLAB_TRIGGER_TOKEN, GITLAB_REF);
-# with none set it emits the ticket and sends nothing (alert-only):
+# Reference hand-off (see docs/escalation-ticket-contract.md). Delivers over
+# any combination of GitLab pipeline trigger, generic webhook and email,
+# each independently configured from the unit's environment (GITLAB_URL,
+# GITLAB_PROJECT_ID, GITLAB_TRIGGER_TOKEN, GITLAB_REF; ALERT_WEBHOOK_URL,
+# ALERT_WEBHOOK_HEADER; ALERT_EMAIL_TO, ALERT_EMAIL_FROM, ALERT_SMTP_HOST,
+# ALERT_SMTP_PORT); with none set it emits the ticket and sends nothing
+# (alert-only). Handles unresolved security metadata and failed security
+# livepatch builds that have exhausted build failure review, if configured.
 # security_escalation_command_template = python3 -m livepatch_repo.escalation_ticket --report {report}
 security_escalation_command_template =
 security_escalation_timeout_seconds = 300
+# A newly available kernel without complete updateinfo alerts immediately.
+# If it remains unresolved for this long, reconciliation raises a distinct
+# timeout alert so an external notification hook is invoked again.
+metadata_pending_timeout_seconds = 86400
+
+# Optional. When a livepatch build fails, give an operator-configured review
+# step (e.g. an agent working under human guidance, scoped and approved
+# ahead of time) first refusal before the failure reaches
+# security_escalation_command_template above. Must return promptly -- it is
+# a trigger, not the review itself, same discipline as the escalation hook.
+# Reconcile retries the build every tick regardless; if the review's fix
+# lands, the next build just succeeds. Left empty (the default), build
+# failures escalate immediately, exactly as if this hook did not exist. See
+# docs/escalation-ticket-contract.md.
+# build_failure_review_command_template = python3 -m livepatch_repo.escalation_ticket --report {report}
+build_failure_review_command_template =
+build_failure_review_timeout_seconds = 300
+# How long reconcile keeps holding off escalation while the same build
+# failure recurs before giving up on the review and escalating anyway.
+build_failure_review_grace_seconds = 86400
 
 [builders]
 # The builder has one exact base kernel and at most one cumulative target, so
 # jobs are built sequentially; there is no build-concurrency setting.
-kpatch_build_command = kpatch-build
+# Use an absolute path if a source-built kpatch-build (with fixes not yet
+# upstream, see docs/real-kpatch-integration.md) must take precedence over
+# any distro-packaged kpatch-build on PATH -- systemd services and sudo
+# often resolve PATH differently, so relying on bare lookup here is fragile.
+kpatch_build_command = /usr/local/bin/kpatch-build
 # Exact offline-base inputs. The EL9 selector supplies the prepared source
 # tree; these paths must resolve to the matching config and debuginfo image.
 kpatch_config_template = /boot/config-{base}
@@ -81,6 +109,15 @@ family_grace_seconds = 1209600
 # Optional. The command is run after each successful RPM build and before
 # publication. Example:
 # rpm_sign_command_template = rpmsign --addsign {rpm}
+#
+# Left empty (the default), signing is manual: with require_rpm_signing set,
+# reconcile still builds and packages autonomously but holds each completed
+# RPM as 'awaiting-signature' rather than publishing it unsigned. An operator
+# signs the RPM in place at its registry-recorded path (e.g. `rpmsign
+# --addsign <path>` or `rpm --addsign <path>`); the next reconcile run
+# detects the signature and publishes it through the normal path. No
+# separate command or timer is needed -- the existing refresh timer notices
+# on its next tick.
 rpm_sign_command_template =
 
 # This must cryptographically verify the signed package. The builder RPM

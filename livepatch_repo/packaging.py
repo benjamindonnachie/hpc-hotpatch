@@ -71,6 +71,13 @@ def _spec_text(job: BuildJob, rpm_release: int, module_name: str) -> str:
     manifest_file = f"{module_name}.json"
     cve_text = " ".join(job.cves)
     post, preun = scriptlet_texts(job, module_name)
+    posttrans = (
+        f'if [ "$(uname -r)" = "{job.base.nvra}" ] && '
+        f'[ -d "/sys/module/{module_name}" ]; then\n'
+        f"    /usr/sbin/kpatch force unload {module_name} || :\n"
+        "fi\n"
+        f"{post}"
+    )
     return f"""\
 Name:           {name}
 Version:        0
@@ -102,6 +109,12 @@ install -D -m 0644 %{{SOURCE1}} %{{buildroot}}%{{_datadir}}/{name}/{manifest_fil
 
 %preun
 {preun}
+
+# RPM runs the old package's %preun after the new package's %post during an
+# upgrade.  Reassert the new module after that removal step, which is required
+# when a corrected RPM reuses the same livepatch module name.
+%posttrans
+{posttrans}
 
 %files
 %{{_libdir}}/kpatch/{module_file}

@@ -64,6 +64,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(arguments: list[str] | None = None) -> int:
     options = _parser().parse_args(arguments)
+    # Resolve every path argument to absolute up front. Downstream code
+    # (notably rpmbuild scriptlets, which `cd` into %_builddir) breaks on
+    # paths that are still relative to the CLI's invocation directory once
+    # a subprocess changes its own working directory.
+    for name, value in vars(options).items():
+        if isinstance(value, Path):
+            setattr(options, name, value.resolve())
     try:
         config = load_config(options.config)
         if options.command == "reconcile":
@@ -77,7 +84,8 @@ def main(arguments: list[str] | None = None) -> int:
                 f"Reconciled {result.target}: built {result.built}, "
                 f"published {result.published}, covered {result.covered}, "
                 f"no-work {result.no_work}, "
-                f"metadata-pending {result.metadata_pending}"
+                f"metadata-pending {result.metadata_pending}, "
+                f"awaiting-signature {result.awaiting_signature}"
             )
             return 0
         if options.command == "run-job":

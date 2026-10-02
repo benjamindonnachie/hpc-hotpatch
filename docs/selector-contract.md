@@ -73,7 +73,10 @@ The versioned JSON must:
 - group every requested CVE under a ticket that the target changelog associates
   with that CVE, or that reviewed advisory-ticket evidence associates with the
   CVE when the target changelog contains the same ticket (for example, when a
-  CVE is assigned after the fix shipped);
+  CVE is assigned after the fix shipped). A schema version 2 group may instead
+  declare a non-empty `tickets` list when independently ticketed fixes share a
+  cumulative source file; every CVE must be proved by at least one listed
+  ticket;
 - list every ticket-scoped source file; and
 - pin the SHA-256 of each listed file in both prepared source trees.
 

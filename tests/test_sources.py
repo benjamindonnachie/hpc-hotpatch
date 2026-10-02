@@ -8,6 +8,7 @@ from livepatch_repo.sources import (
     parse_advisory_security_cves,
     parse_advisory_ticket_evidence,
     parse_cve_severities,
+    parse_cve_vex_severity,
     parse_notices,
     parse_repoquery,
     parse_updateinfo,
@@ -235,6 +236,38 @@ Description: Security update.
                 ("CVE-2026-43074", "CVE-2026-46242"),
             )
         self.assertEqual(caught.exception.cves, ("CVE-2026-43074",))
+
+    def test_missing_legacy_severity_can_be_deferred_to_vex(self) -> None:
+        self.assertEqual(
+            parse_cve_severities(
+                '[{"CVE":"CVE-2026-46242","severity":"important"}]',
+                ("CVE-2026-43074", "CVE-2026-46242"),
+                require_complete=False,
+            ),
+            {"CVE-2026-46242": "Important"},
+        )
+
+    def test_vex_aggregate_severity_is_parsed_by_exact_identity(self) -> None:
+        output = """{
+          "document": {
+            "tracking": {"id": "CVE-2025-54518"},
+            "aggregate_severity": {"text": "Important"}
+          }
+        }"""
+        self.assertEqual(
+            parse_cve_vex_severity(output, "CVE-2025-54518"),
+            "Important",
+        )
+
+    def test_vex_wrong_identity_fails_closed(self) -> None:
+        output = """{
+          "document": {
+            "tracking": {"id": "CVE-2025-00000"},
+            "aggregate_severity": {"text": "Important"}
+          }
+        }"""
+        with self.assertRaisesRegex(ValueError, "unexpected CVE"):
+            parse_cve_vex_severity(output, "CVE-2025-54518")
 
     def test_unrecognised_cve_severity_fails_closed(self) -> None:
         with self.assertRaises(SecurityCoverageError) as caught:

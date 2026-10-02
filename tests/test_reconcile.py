@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import shlex
 import shutil
 import tempfile
 import threading
@@ -12,11 +13,16 @@ from livepatch_repo.config import Config
 from livepatch_repo.escalation import SecurityCoverageError
 from livepatch_repo.models import (
     AdvisoryFix,
+    BuildJob,
     KernelRelease,
     RepositoryNotice,
 )
 from livepatch_repo.packaging import package_name
-from livepatch_repo.reconcile import _compute_pinned, reconcile_repository
+from livepatch_repo.reconcile import (
+    _build_failure_diagnostics,
+    _compute_pinned,
+    reconcile_repository,
+)
 from livepatch_repo.publication import PublicationResult, publish_repository
 from livepatch_repo.runner import JobResult
 from livepatch_repo.sources import RepositorySnapshot
@@ -95,6 +101,82 @@ class TestReconcile(unittest.TestCase):
             modinfo_command="modinfo",
             rpmbuild_command="rpmbuild",
         )
+
+    def test_build_failure_reports_only_newly_uncovered_cves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rpm = root / "published.rpm"
+            rpm.write_bytes(b"rpm")
+            job = BuildJob(
+                self.base,
+                self.target,
+                ("CVE-2026-12345", "CVE-2026-43499"),
+                "planned",
+                "kpatch-build",
+            )
+            registry = {
+                "jobs": {
+                    "published": {
+                        "status": "published",
+                        "rpm_release": 3,
+                        "published_rpm": str(rpm),
+                        "signature": {
+                            "base": self.base.nvra,
+                            "target": "5.14.0-687.25.1.el9_8.x86_64",
+                            "cves": ["CVE-2026-12345"],
+                        },
+                    }
+                }
+            }
+            workspace = root / job.job_id
+            cache = workspace / "kpatch-cache"
+            cache.mkdir(parents=True)
+            (cache / "build.log").write_text(
+                "Extracting new and modified ELF sections\n"
+                "ERROR: changed section .sched.text not selected for inclusion\n"
+                "ERROR: changed section .rela.sched.text not selected for inclusion\n"
+                "ERROR: kernel/locking/rtmutex_api.o: 2 unsupported section change(s)\n",
+                encoding="utf-8",
+            )
+            (workspace / "selection.json").write_text(
+                json.dumps(
+                    {
+                        "selected_patches": [
+                            {
+                                "patch": "1766-rtmutex.patch",
+                                "cves": ["CVE-2026-43499"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            cves, kind, diagnostics = _build_failure_diagnostics(
+                job=job,
+                workspace=workspace,
+                registry=registry,
+                error=ValueError("kpatch failed"),
+            )
+
+            self.assertEqual(cves, ("CVE-2026-43499",))
+            self.assertEqual(kind, "unsupported-elf-section")
+            self.assertEqual(
+                diagnostics["unsupported_changes"],
+                [
+                    {
+                        "object": "kernel/locking/rtmutex_api.o",
+                        "sections": [".sched.text", ".rela.sched.text"],
+                    }
+                ],
+            )
+            self.assertEqual(
+                diagnostics["selected_patches"],
+                [{"patch": "1766-rtmutex.patch", "cves": ["CVE-2026-43499"]}],
+            )
+            self.assertEqual(
+                diagnostics["last_published_coverage"]["rpm_release"], 3
+            )
 
     def test_successful_job_is_not_rebuilt_on_next_reconcile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -456,6 +538,66 @@ class TestReconcile(unittest.TestCase):
             )
             self.assertEqual(statuses, ["failed"])
 
+    def test_build_failure_review_holds_off_escalation_until_grace_expires(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            counter = root / "review-count"
+            script = root / "review.sh"
+            script.write_text(
+                f'#!/bin/sh\nprintf x >> "{counter}"\n', encoding="utf-8"
+            )
+            script.chmod(0o755)
+
+            def build(job, *, config, work_root, rpm_release):
+                raise ValueError("deliberate build failure")
+
+            def unexpected(*args, **kwargs):
+                raise AssertionError("must not publish a failed build")
+
+            common = dict(
+                state_dir=root / "state",
+                work_root=root / "work",
+                repository_root=root / "repo",
+                snapshot=self.snapshot,
+                build_function=build,
+                publish_function=unexpected,
+            )
+            escalation_path = root / "state" / "escalation.json"
+            review_path = root / "state" / "build-failure-review.json"
+
+            reviewed_config = Config(
+                **{
+                    **self.config.__dict__,
+                    "build_failure_review_command_template": f"{script} {{base}}",
+                }
+            )
+            with self.assertRaises(ValueError):
+                reconcile_repository(config=reviewed_config, **common)
+            self.assertFalse(escalation_path.exists())
+            self.assertTrue(review_path.is_file())
+            self.assertEqual(counter.read_text(encoding="utf-8"), "x")
+
+            # Same failure recurs on the next tick, still within the grace
+            # window: no re-dispatch, still no escalation.
+            with self.assertRaises(ValueError):
+                reconcile_repository(config=reviewed_config, **common)
+            self.assertFalse(escalation_path.exists())
+            self.assertEqual(counter.read_text(encoding="utf-8"), "x")
+
+            # Grace window forced to zero: the same failure now escalates for
+            # real, exactly as if no review were configured.
+            expired_config = Config(
+                **{
+                    **reviewed_config.__dict__,
+                    "build_failure_review_grace_seconds": 0,
+                }
+            )
+            with self.assertRaises(ValueError):
+                reconcile_repository(config=expired_config, **common)
+            self.assertTrue(escalation_path.is_file())
+
     def test_failed_job_reuses_allocated_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -581,6 +723,181 @@ class TestReconcile(unittest.TestCase):
                 covered[0]["rpm"],
             )
 
+    def test_bugfix_target_inherits_terminal_build_gap_without_rebuild(self) -> None:
+        failed_target = KernelRelease(
+            "kernel-core", "0", "5.14.0", "687.25.1.el9_8", "x86_64"
+        )
+        failed_snapshot = RepositorySnapshot(
+            (self.base, failed_target),
+            (AdvisoryFix("CVE-2026-43499", failed_target, "Important"),),
+            (
+                RepositoryNotice(
+                    "ALSA-2026:10000", "security", failed_target
+                ),
+            ),
+        )
+        later_snapshot = RepositorySnapshot(
+            (self.base, failed_target, self.target),
+            (AdvisoryFix("CVE-2026-43499", failed_target, "Important"),),
+            (
+                RepositoryNotice(
+                    "ALSA-2026:10000", "security", failed_target
+                ),
+                RepositoryNotice("ALBA-2026:10001", "bugfix", self.target),
+            ),
+        )
+        metadata_pending_snapshot = RepositorySnapshot(
+            (self.base, failed_target, self.target),
+            (AdvisoryFix("CVE-2026-43499", failed_target, "Important"),),
+            (
+                RepositoryNotice(
+                    "ALSA-2026:10000", "security", failed_target
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builds: list[str] = []
+
+            def unsupported(job, *, config, work_root, rpm_release):
+                builds.append(job.target.nvra)
+                cache = work_root / job.job_id / "kpatch-cache"
+                cache.mkdir(parents=True)
+                (cache / "build.log").write_text(
+                    "Extracting new and modified ELF sections\n"
+                    "ERROR: changed section .sched.text not selected for inclusion\n"
+                    "ERROR: kernel/locking/rtmutex_api.o: 1 unsupported section change(s)\n",
+                    encoding="utf-8",
+                )
+                raise ValueError("create-diff-object failed")
+
+            common = {
+                "config": self.config,
+                "state_dir": root / "state",
+                "work_root": root / "work",
+                "repository_root": root / "repo",
+            }
+            with self.assertRaises(SecurityCoverageError) as first:
+                reconcile_repository(
+                    snapshot=failed_snapshot,
+                    build_function=unsupported,
+                    **common,
+                )
+            self.assertEqual(first.exception.failure_kind, "unsupported-elf-section")
+
+            def unexpected(*args, **kwargs):
+                raise AssertionError("terminal same-base gap must skip kpatch-build")
+
+            with self.assertRaises(SecurityCoverageError) as pending:
+                reconcile_repository(
+                    snapshot=metadata_pending_snapshot,
+                    build_function=unexpected,
+                    **common,
+                )
+            self.assertEqual(
+                pending.exception.failure_kind,
+                "inherited-terminal-build-gap",
+            )
+            self.assertEqual(
+                pending.exception.diagnostics["uncovered_cve_severity"],
+                {"CVE-2026-43499": "Important"},
+            )
+
+            with self.assertRaises(SecurityCoverageError) as inherited:
+                reconcile_repository(
+                    snapshot=later_snapshot,
+                    build_function=unexpected,
+                    **common,
+                )
+            self.assertEqual(
+                inherited.exception.failure_kind,
+                "inherited-terminal-build-gap",
+            )
+            self.assertEqual(inherited.exception.cves, ("CVE-2026-43499",))
+            self.assertTrue(inherited.exception.diagnostics["build_skipped"])
+            self.assertEqual(
+                inherited.exception.diagnostics["failed_target"],
+                failed_target.nvra,
+            )
+            self.assertEqual(builds, [failed_target.nvra])
+            registry = json.loads(
+                (root / "state" / "registry.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(list(registry["family_releases"].values()), [1])
+            self.assertEqual(len(registry["jobs"]), 1)
+            entry = next(iter(registry["jobs"].values()))
+            self.assertTrue(entry["terminal_for_base"])
+            self.assertEqual(entry["uncovered_cves"], ["CVE-2026-43499"])
+
+    def test_legacy_escalation_record_stops_later_redundant_build(self) -> None:
+        failed_target = KernelRelease(
+            "kernel-core", "0", "5.14.0", "687.25.1.el9_8", "x86_64"
+        )
+        failed_snapshot = RepositorySnapshot(
+            (self.base, failed_target),
+            (AdvisoryFix("CVE-2026-43499", failed_target, "Important"),),
+            (RepositoryNotice("ALSA-2026:10000", "security", failed_target),),
+        )
+        later_snapshot = RepositorySnapshot(
+            (self.base, failed_target, self.target),
+            (AdvisoryFix("CVE-2026-43499", failed_target, "Important"),),
+            (
+                RepositoryNotice("ALSA-2026:10000", "security", failed_target),
+                RepositoryNotice("ALBA-2026:10001", "bugfix", self.target),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def unsupported(job, *, config, work_root, rpm_release):
+                cache = work_root / job.job_id / "kpatch-cache"
+                cache.mkdir(parents=True)
+                (cache / "build.log").write_text(
+                    "Extracting new and modified ELF sections\n"
+                    "ERROR: changed section .sched.text not selected for inclusion\n"
+                    "ERROR: kernel/locking/rtmutex_api.o: 1 unsupported section change(s)\n",
+                    encoding="utf-8",
+                )
+                raise ValueError("create-diff-object failed")
+
+            common = {
+                "config": self.config,
+                "state_dir": root / "state",
+                "work_root": root / "work",
+                "repository_root": root / "repo",
+            }
+            with self.assertRaises(SecurityCoverageError):
+                reconcile_repository(
+                    snapshot=failed_snapshot,
+                    build_function=unsupported,
+                    **common,
+                )
+            registry_path = root / "state" / "registry.json"
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            entry = next(iter(registry["jobs"].values()))
+            for key in (
+                "failure_stage",
+                "failure_kind",
+                "uncovered_cves",
+                "terminal_for_base",
+                "failure_diagnostics",
+            ):
+                entry.pop(key)
+            registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+            with self.assertRaises(SecurityCoverageError) as inherited:
+                reconcile_repository(
+                    snapshot=later_snapshot,
+                    build_function=lambda *args, **kwargs: (_ for _ in ()).throw(
+                        AssertionError("legacy terminal gap must skip build")
+                    ),
+                    **common,
+                )
+            self.assertEqual(
+                inherited.exception.diagnostics["source"],
+                "escalation-record",
+            )
+
     def test_superseded_release_drops_from_published_repository(self) -> None:
         t1 = KernelRelease("kernel-core", "0", "5.14.0", "687.25.1.el9_8", "x86_64")
         t2 = self.target  # 687.26.1
@@ -650,7 +967,11 @@ class TestReconcile(unittest.TestCase):
             self.assertEqual(len(packages), 1)
 
     def test_idle_reconcile_publishes_expired_family_removal(self) -> None:
-        pending = RepositorySnapshot((self.base, self.target), (), ())
+        idle = RepositorySnapshot(
+            (self.base, self.target),
+            (),
+            (RepositoryNotice("ALBA-2026:10001", "bugfix", self.target),),
+        )
         config = Config(
             **{
                 **self.config.__dict__,
@@ -702,7 +1023,7 @@ class TestReconcile(unittest.TestCase):
                 state_dir=state,
                 work_root=root / "work",
                 repository_root=root / "repo",
-                snapshot=pending,
+                snapshot=idle,
                 build_function=lambda *args, **kwargs: (_ for _ in ()).throw(
                     AssertionError("build should not run")
                 ),
@@ -800,26 +1121,103 @@ class TestReconcile(unittest.TestCase):
             )
             self.assertEqual(pooled, [b2_pkg])
 
-    def test_metadata_pending_does_not_dispatch_a_build(self) -> None:
+    def test_metadata_pending_alerts_immediately_then_times_out(self) -> None:
         pending = RepositorySnapshot((self.base, self.target), (), ())
+        start = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        config = Config(
+            **{
+                **self.config.__dict__,
+                "metadata_pending_timeout_seconds": 60,
+            }
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
 
             def unexpected(*args, **kwargs):
                 raise AssertionError("build should not run")
 
-            result = reconcile_repository(
-                config=self.config,
-                state_dir=root / "state",
-                work_root=root / "work",
-                repository_root=root / "repo",
-                snapshot=pending,
-                build_function=unexpected,
+            common = {
+                "config": config,
+                "state_dir": root / "state",
+                "work_root": root / "work",
+                "repository_root": root / "repo",
+                "snapshot": pending,
+                "build_function": unexpected,
+            }
+            with mock.patch(
+                "livepatch_repo.reconcile._now", return_value=start
+            ):
+                with self.assertRaises(SecurityCoverageError) as immediate:
+                    reconcile_repository(**common)
+            self.assertEqual(
+                immediate.exception.failure_kind,
+                "repository-metadata-pending",
             )
-            self.assertEqual(result.metadata_pending, 1)
-            self.assertEqual(result.built, 0)
+            state = json.loads(
+                (root / "state" / "metadata-pending.json").read_text()
+            )
+            self.assertEqual(state["age_seconds"], 0)
+            self.assertFalse(state["timed_out"])
+            self.assertEqual(state["pending_reason"], "missing-target-updateinfo")
+            self.assertFalse((root / "work").exists())
 
-    def test_required_signing_fails_before_build_dispatch(self) -> None:
+            with mock.patch(
+                "livepatch_repo.reconcile._now",
+                return_value=start + timedelta(seconds=60),
+            ):
+                with self.assertRaises(SecurityCoverageError) as timed_out:
+                    reconcile_repository(**common)
+            self.assertEqual(
+                timed_out.exception.failure_kind,
+                "repository-metadata-timeout",
+            )
+            self.assertEqual(timed_out.exception.diagnostics["age_seconds"], 60)
+            escalation = json.loads(
+                (root / "state" / "escalation.json").read_text()
+            )
+            self.assertEqual(
+                escalation["failure_kind"], "repository-metadata-timeout"
+            )
+
+    def test_complete_bugfix_metadata_clears_pending_alert_without_build(self) -> None:
+        pending = RepositorySnapshot((self.base, self.target), (), ())
+        complete = RepositorySnapshot(
+            (self.base, self.target),
+            (),
+            (RepositoryNotice("ALBA-2026:10001", "bugfix", self.target),),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def unexpected(*args, **kwargs):
+                raise AssertionError("build should not run")
+
+            common = {
+                "config": self.config,
+                "state_dir": root / "state",
+                "work_root": root / "work",
+                "repository_root": root / "repo",
+                "build_function": unexpected,
+            }
+            with self.assertRaises(SecurityCoverageError):
+                reconcile_repository(snapshot=pending, **common)
+            pending_path = root / "state" / "metadata-pending.json"
+            self.assertTrue(pending_path.is_file())
+
+            result = reconcile_repository(snapshot=complete, **common)
+            self.assertEqual(result.no_work, 1)
+            self.assertEqual(result.built, 0)
+            self.assertFalse(pending_path.exists())
+            registry = json.loads(
+                (root / "state" / "registry.json").read_text()
+            )
+            self.assertEqual(registry["jobs"], {})
+
+    def test_signing_without_sign_template_holds_awaiting_signature(self) -> None:
+        # require_rpm_signing with no rpm_sign_command_template is a
+        # deliberate configuration for manual signing: the build must still
+        # run autonomously, and the result must be held unpublished rather
+        # than either failing the run or publishing unsigned.
         config = Config(
             **{
                 **self.config.__dict__,
@@ -829,18 +1227,107 @@ class TestReconcile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
 
-            def unexpected(*args, **kwargs):
-                raise AssertionError("build should not run")
+            def build(job, *, config, work_root, rpm_release):
+                rpm = work_root / "unsigned.rpm"
+                rpm.parent.mkdir(parents=True, exist_ok=True)
+                rpm.write_bytes(b"rpm")
+                return JobResult(job.job_id, "built", str(rpm))
 
-            with self.assertRaisesRegex(ValueError, "signing is required"):
-                reconcile_repository(
-                    config=config,
-                    state_dir=root / "state",
-                    work_root=root / "work",
-                    repository_root=root / "repo",
-                    snapshot=self.snapshot,
-                    build_function=unexpected,
+            def unexpected(*args, **kwargs):
+                raise AssertionError("unsigned RPM must not be published")
+
+            result = reconcile_repository(
+                config=config,
+                state_dir=root / "state",
+                work_root=root / "work",
+                repository_root=root / "repo",
+                snapshot=self.snapshot,
+                build_function=build,
+                publish_function=unexpected,
+            )
+            self.assertEqual(result.built, 1)
+            self.assertEqual(result.published, 0)
+            self.assertEqual(result.awaiting_signature, 1)
+            registry = json.loads(
+                (root / "state" / "registry.json").read_text(encoding="utf-8")
+            )
+            entry = next(iter(registry["jobs"].values()))
+            self.assertEqual(entry["status"], "awaiting-signature")
+
+    def test_manually_signed_rpm_is_promoted_and_published_on_next_reconcile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            signed_marker = root / "signed"
+            checker = root / "checker"
+            # Reports unsigned until the marker file exists, simulating an
+            # operator running `rpm --addsign` between reconcile runs.
+            checker.write_text(
+                "#!/bin/sh\n"
+                f"if [ -e {shlex.quote(str(signed_marker))} ]; then\n"
+                "  printf 'sigheader\\n(none)\\n(none)\\n(none)\\n'\n"
+                "else\n"
+                "  printf '(none)\\n(none)\\n(none)\\n(none)\\n'\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            checker.chmod(0o755)
+            verifier = root / "verifier"
+            verifier.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            verifier.chmod(0o755)
+            config = Config(
+                **{
+                    **self.config.__dict__,
+                    "require_rpm_signing": True,
+                    "rpm_command": str(checker),
+                    "rpm_verify_command_template": f"{verifier} {{rpm}}",
+                }
+            )
+
+            def build(job, *, config, work_root, rpm_release):
+                rpm = work_root / "unsigned.rpm"
+                rpm.parent.mkdir(parents=True, exist_ok=True)
+                rpm.write_bytes(b"rpm")
+                return JobResult(job.job_id, "built", str(rpm))
+
+            published_rpms: list[Path] = []
+
+            def publish(repository_root, rpms, **kwargs):
+                published_rpms.extend(rpms)
+                return PublicationResult(
+                    current=repository_root / "current",
+                    objects_by_name={rpm.name: rpm for rpm in rpms},
+                    removed_versions=(),
+                    removed_objects=(),
                 )
+
+            common = dict(
+                config=config,
+                state_dir=root / "state",
+                work_root=root / "work",
+                repository_root=root / "repo",
+                snapshot=self.snapshot,
+                build_function=build,
+                publish_function=publish,
+            )
+            first = reconcile_repository(**common)
+            self.assertEqual(first.awaiting_signature, 1)
+            self.assertEqual(first.published, 0)
+            self.assertEqual(published_rpms, [])
+
+            # Operator signs the RPM in place between reconcile runs.
+            signed_marker.touch()
+
+            second = reconcile_repository(**common)
+            self.assertEqual(second.awaiting_signature, 0)
+            self.assertEqual(second.published, 1)
+            self.assertEqual(len(published_rpms), 1)
+            registry = json.loads(
+                (root / "state" / "registry.json").read_text(encoding="utf-8")
+            )
+            entry = next(iter(registry["jobs"].values()))
+            self.assertEqual(entry["status"], "published")
 
     def test_signature_verification_failure_blocks_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

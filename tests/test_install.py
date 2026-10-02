@@ -57,8 +57,79 @@ class TestCentralInstaller(unittest.TestCase):
                 ).is_dir()
             )
             self.assertTrue(
-                (staged / "srv/livepatch-repo/alma/9/x86_64").is_dir()
+                (staged / "var/lib/klp-policy/build/el9_8-x86_64").is_dir()
             )
+            self.assertTrue((staged / "srv/klp/repo").is_dir())
+
+            environment = (
+                staged / "etc" / "livepatch-repo" / "el9_8-x86_64.env"
+            )
+            env_text = environment.read_text(encoding="utf-8")
+            self.assertIn(f"REPOSITORY_ROOT={staged}/srv/klp/repo", env_text)
+            self.assertIn(
+                f"WORK_ROOT={staged}/var/lib/klp-policy/build/el9_8-x86_64",
+                env_text,
+            )
+            self.assertIn(
+                f"STATE_DIR={staged}/var/lib/livepatch-repo/el9_8-x86_64/state",
+                env_text,
+            )
+
+            service_text = service.read_text(encoding="utf-8")
+            self.assertIn("User=klp-build", service_text)
+            self.assertIn("Group=klp-build", service_text)
+            self.assertIn("${WORK_ROOT}", service_text)
+            self.assertIn("${STATE_DIR}", service_text)
+            self.assertIn("${REPOSITORY_ROOT}", service_text)
+
+    def test_paths_and_build_account_are_customisable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            staged = Path(temporary) / "root"
+            custom_work = Path(temporary) / "big-disk" / "work"
+            custom_repo = Path(temporary) / "served" / "repo"
+            custom_state = Path(temporary) / "state-area"
+            subprocess.run(
+                [
+                    "bash",
+                    str(INSTALLER),
+                    "--root",
+                    str(staged),
+                    "--work-root",
+                    str(custom_work),
+                    "--repository-root",
+                    str(custom_repo),
+                    "--state-dir",
+                    str(custom_state),
+                    "--build-user",
+                    "custom-klp",
+                    "--build-group",
+                    "custom-klp-grp",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            environment = (
+                staged / "etc" / "livepatch-repo" / "el9_8-x86_64.env"
+            )
+            env_text = environment.read_text(encoding="utf-8")
+            self.assertIn(f"WORK_ROOT={custom_work}", env_text)
+            self.assertIn(f"REPOSITORY_ROOT={custom_repo}", env_text)
+            self.assertIn(f"STATE_DIR={custom_state}", env_text)
+            self.assertTrue(custom_work.is_dir())
+            self.assertTrue(custom_repo.is_dir())
+            self.assertTrue(custom_state.is_dir())
+
+            service = (
+                staged
+                / "etc"
+                / "systemd"
+                / "system"
+                / "livepatch-repo-refresh@.service"
+            )
+            service_text = service.read_text(encoding="utf-8")
+            self.assertIn("User=custom-klp", service_text)
+            self.assertIn("Group=custom-klp-grp", service_text)
 
     def test_unknown_argument_fails(self) -> None:
         completed = subprocess.run(
